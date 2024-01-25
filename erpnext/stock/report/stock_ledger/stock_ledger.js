@@ -100,6 +100,16 @@ frappe.query_reports["Stock Ledger"] = {
 		else if (column.fieldname == "in_qty" && data && data.in_qty > 0) {
 			value = "<span style='color:green'>" + value + "</span>";
 		}
+		else if (column.fieldname == "voucher_type") {
+			if(value=="Stock Reconciliation"){
+				value = "库存调账"
+			}
+			if(value=="Stock Entry"){
+				value = "物料移动"
+			}
+
+			// value = "<span style='color:green'>" + value + "</span>";
+		}
 
 		return value;
 	},
