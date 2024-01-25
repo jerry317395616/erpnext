@@ -2,7 +2,7 @@
  "action": "Show Form Tour",
  "action_label": "Take a walk through Stock Settings",
  "creation": "2020-05-15 02:53:57.209967",
- "description": "# Review Stock Settings\n\nIn ERPNext, the Stock module\u2019s features are configurable as per your business needs. Stock Settings is the place where you can set your preferences for:\n- Default values for Item and Pricing\n- Default valuation method for inventory valuation\n- Set preference for serialization and batching of item\n- Set tolerance for over-receipt and delivery of items",
+ "description": "# 查看库存设置\n\n在ERPNext中，Stock模块的功能可以根据您的业务需求进行配置。 在“库存设置”中，您可以设置以下首选项：\n- “物料”和“定价”的默认值\n- 存货估价的默认估价方法\n- 设置物料序列化和批处理的首选项\n- 设置超额接收和交付物品的容差",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
