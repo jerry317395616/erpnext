@@ -100,6 +100,9 @@ frappe.query_reports["Stock Ledger"] = {
 		else if (column.fieldname == "in_qty" && data && data.in_qty > 0) {
 			value = "<span style='color:green'>" + value + "</span>";
 		}
+		else if (column.fieldname == "voucher_type") {
+			value = __(value)
+		}
 
 		return value;
 	},
