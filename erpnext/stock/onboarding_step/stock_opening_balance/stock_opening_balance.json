@@ -1,6 +1,6 @@
 {
  "action": "Create Entry",
- "action_label": "Let\u2019s create a stock opening entry",
+ "action_label": "让我们创建一个库存分录",
  "creation": "2021-05-17 16:13:47.511883",
  "description": "# 更新库存期初余额\n用于更新仓库中物品的库存余额，日期和时间\n\n更新期初库存后，您可以创建制造和库存交付等交易记录，这些交易将在其中消耗此期初库存。",
  "docstatus": 0,

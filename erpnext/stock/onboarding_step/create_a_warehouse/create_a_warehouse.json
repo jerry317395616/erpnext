@@ -1,6 +1,6 @@
 {
  "action": "Create Entry",
- "action_label": "Let\u2019s create your first  warehouse ",
+ "action_label": "让我们创建您的第一个仓库",
  "creation": "2021-05-17 16:13:19.297789",
  "description": "# 设置仓库\n仓库可以是您的位置/仓库/商店，您可以在其中维护物品的库存，并将它们接收/交付给各方。\n\n您可以在树状结构中维护仓库，以便可以跟踪物料的位置和子位置。此外，您可以将仓库链接到特定的会计分类帐，其中将反映该仓库物料的实时库存价值。",
  "docstatus": 0,
