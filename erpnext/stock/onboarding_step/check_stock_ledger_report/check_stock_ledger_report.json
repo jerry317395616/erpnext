@@ -2,7 +2,7 @@
  "action": "View Report",
  "action_label": "Check Stock Ledger",
  "creation": "2023-05-29 13:46:04.174565",
- "description": "# Check Stock Reports\nBased on the various stock transactions, you can get a host of one-click Stock Reports in ERPNext like Stock Ledger, Stock Balance, Projected Quantity, and Ageing analysis.",
+ "description": "# 查看库存报告\n根据各种库存交易，您可以在ERPNext中获得大量一键式库存报告，如库存分类账，库存余额，预计数量和账龄分析。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
