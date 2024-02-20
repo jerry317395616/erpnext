@@ -2,7 +2,7 @@
  "action": "Create Entry",
  "action_label": "Create a Material Transfer Entry",
  "creation": "2020-05-15 03:20:16.277043",
- "description": "# Manage Stock Movements\nStock entry allows you to register the movement of stock for various purposes like transfer, received, issues, repacked, etc. To address issues related to theft and pilferages,  you can always ensure that the movement of goods happens against a document reference Stock Entry in ERPNext.\n\nLet\u2019s get a quick walk-through on the various scenarios covered in Stock Entry by watching [*this video*](https://www.youtube.com/watch?v=Njt107hlY3I).",
+ "description": "# 管理库存变动\n库存录入允许您为各种目的（如转移、接收、发货、重新包装等）登记库存的移动。为了解决与盗窃和盗窃有关的问题，您始终可以确保货物的移动是针对ERPNext中的文档参考库存输入进行的。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
