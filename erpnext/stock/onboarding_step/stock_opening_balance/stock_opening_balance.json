@@ -2,7 +2,7 @@
  "action": "Create Entry",
  "action_label": "Let\u2019s create a stock opening entry",
  "creation": "2021-05-17 16:13:47.511883",
- "description": "# Update Stock Opening Balance\nIt\u2019s an entry to update the stock balance of an item, in a warehouse, on a date and time you are going live on ERPNext.\n\nOnce opening stocks are updated, you can create transactions like manufacturing and stock deliveries, where this opening stock will be consumed.",
+ "description": "# 更新库存期初余额\n用于更新仓库中物品的库存余额，日期和时间\n\n更新期初库存后，您可以创建制造和库存交付等交易记录，这些交易将在其中消耗此期初库存。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
