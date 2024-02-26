@@ -1,8 +1,8 @@
 {
  "action": "Show Form Tour",
- "action_label": "Let\u2019s convert your first Sales Order against a Quotation",
+ "action_label": "让我们根据报价单转换您的第一个销售订单",
  "creation": "2021-08-13 14:03:49.217866",
- "description": "# Sales Order\n\nA Sales Order is a confirmation of an order from your customer. It is also referred to as Proforma Invoice.\n\nSales Order at the heart of your sales and purchase transactions. Sales Orders are linked in Delivery Note, Sales Invoices, Material Request, and Maintenance transactions. Through Sales Order, you can track fulfillment of the overall deal towards the customer.",
+ "description": "# 销售订单\n\n销售订单是客户对订单的确认。它也被称为形式发票。\n\n销售订单是销售和采购交易的核心。销售订单在交货单、销售发票、物料请求和维护交易记录中链接。通过销售订单，您可以跟踪对客户的整体交易的履行情况。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,

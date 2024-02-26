@@ -1,8 +1,8 @@
 {
  "action": "Show Form Tour",
- "action_label": "Let\u2019s walk-through Selling Settings",
+ "action_label": "让我们来看看销售设置",
  "creation": "2020-06-01 13:01:45.615189",
- "description": "# Selling Settings\n\nCRM and Selling module\u2019s features are configurable as per your business needs. Selling Settings is the place where you can set your preferences for:\n - Customer naming and default values\n - Billing and shipping preference in sales transactions\n",
+ "description": "# 销售设置\n\nCRM和销售模块的功能可根据您的业务需求进行配置。在销售设置中，您可以设置以下方面的偏好：\n - 客户命名和默认值\n - 销售交易中的计费和运输首选项\n",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
