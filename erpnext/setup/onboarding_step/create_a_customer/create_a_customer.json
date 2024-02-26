@@ -2,7 +2,7 @@
  "action": "Create Entry",
  "action_label": "Let\u2019s create your first Customer",
  "creation": "2020-05-14 17:46:41.831517",
- "description": "# Create a Customer\n\nThe Customer master is at the heart of your sales transactions. Customers are linked in Quotations, Sales Orders, Invoices, and Payments. Customers can be either numbered or identified by name (you would typically do this based on the number of customers you have).\n\nThrough Customer\u2019s master, you can effectively track essentials like:\n - Customer\u2019s multiple address and contacts\n - Account Receivables\n - Credit Limit and Credit Period\n",
+ "description": "# 创建客户\n\n客户主数据是销售交易的核心。客户在报价单、销售订单、发票和付款中链接。可以对客户进行编号或按名称标识（通常根据您拥有的客户数量来执行此操作）。\n\n通过客户的主数据，您可以有效地跟踪以下要点：\n - 客户的多个地址和联系人\n - 应收账款\n - 信用额度和信用期\n",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 1,

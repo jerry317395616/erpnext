@@ -1,7 +1,7 @@
 {
  "action": "Create Entry",
  "creation": "2020-05-14 17:48:21.019019",
- "description": "# All about sales invoice\n\nA Sales Invoice is a bill that you send to your Customers against which the Customer makes the payment. Sales Invoice is an accounting transaction. On submission of Sales Invoice, the system updates the receivable and books income against a Customer Account.",
+ "description": "# 关于销售发票\n\n销售发票是您发送给客户的账单，客户根据该账单进行付款。销售发票是一种会计交易记录。提交销售发票后，系统会根据客户帐户更新应收账款和账面收入。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
