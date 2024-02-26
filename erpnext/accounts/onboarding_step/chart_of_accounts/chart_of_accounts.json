@@ -1,6 +1,6 @@
 {
  "action": "Go to Page",
- "action_label": "Learn more about Chart of Accounts",
+ "action_label": "了解有关会计科目表的更多信息",
  "callback_message": "You can continue with the onboarding after exploring this page",
  "callback_title": "Explore Chart of Accounts",
  "creation": "2020-05-13 19:58:20.928127",
