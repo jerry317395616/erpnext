@@ -1,6 +1,6 @@
 {
  "action": "Create Entry",
- "action_label": "Let\u2019s create your first Customer",
+ "action_label": "让我们创建您的第一个客户",
  "creation": "2020-05-14 17:46:41.831517",
  "description": "# 创建客户\n\n客户主数据是销售交易的核心。客户在报价单、销售订单、发票和付款中链接。可以对客户进行编号或按名称标识（通常根据您拥有的客户数量来执行此操作）。\n\n通过客户的主数据，您可以有效地跟踪以下要点：\n - 客户的多个地址和联系人\n - 应收账款\n - 信用额度和信用期\n",
  "docstatus": 0,
