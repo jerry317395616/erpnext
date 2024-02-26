@@ -2,7 +2,7 @@
  "action": "Watch Video",
  "action_label": "Learn how to update opening balances",
  "creation": "2021-07-12 11:53:50.525030",
- "description": "# Updating Opening Balances\n\nOnce you close the financial statement in previous accounting software, you can update the same as opening in your ERPNext's Balance Sheet accounts. This will allow you to get complete financial statements from ERPNext in the coming years, and discontinue the parallel accounting system right away.",
+ "description": "# 更新期初余额\n\n在以前的会计软件中关闭财务报表后，您可以更新与在系统的资产负债表帐户中打开的财务报表相同的内容。这将使您能够在未来几年内从系统获得完整的财务报表，并立即停止并行会计系统。",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,
@@ -18,5 +18,5 @@
  "show_full_form": 0,
  "title": "Updating Opening Balances",
  "validate_action": 1,
- "video_url": "https://www.youtube.com/embed/U5wPIvEn-0c"
+ "video_url": ""
 }
