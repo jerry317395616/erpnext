@@ -2,7 +2,7 @@
  "action": "Create Entry",
  "action_label": "Create a new Item",
  "creation": "2021-05-17 13:47:18.515052",
- "description": "# Create an Item\n\nItem is a product or a service offered by your company, or something you buy as a part of your supplies or raw materials.\n\nItems are integral to everything you do in ERPNext - from billing, purchasing to managing inventory. Everything you buy or sell, whether it is a physical product or a service is an Item. Items can be stock, non-stock, variants, serialized, batched, assets, etc.\n",
+ "description": "# 创建物料\n\n物品是贵公司提供的产品或服务，或者您作为供应品或原材料的一部分购买的东西。\n\n物品是您在系统中所做的一切不可或缺的一部分 - 从计费，采购到管理库存。您购买或出售的所有东西，无论是实物产品还是服务，都是物品。物料可以是库存、非库存、变型、序列化、批处理、资产等。\n",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "form_tour": "Item General",
