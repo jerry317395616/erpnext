@@ -28,43 +28,43 @@ def install(country=None):
 		# ensure at least an empty Address Template exists for this Country
 		{"doctype": "Address Template", "country": country},
 		# item group
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("All Item Groups"),
-			"is_group": 1,
-			"parent_item_group": "",
-		},
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("Products"),
-			"is_group": 0,
-			"parent_item_group": _("All Item Groups"),
-			"show_in_website": 1,
-		},
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("Raw Material"),
-			"is_group": 0,
-			"parent_item_group": _("All Item Groups"),
-		},
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("Services"),
-			"is_group": 0,
-			"parent_item_group": _("All Item Groups"),
-		},
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("Sub Assemblies"),
-			"is_group": 0,
-			"parent_item_group": _("All Item Groups"),
-		},
-		{
-			"doctype": "Item Group",
-			"item_group_name": _("Consumable"),
-			"is_group": 0,
-			"parent_item_group": _("All Item Groups"),
-		},
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("All Item Groups"),
+		# 	"is_group": 1,
+		# 	"parent_item_group": "",
+		# },
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("Products"),
+		# 	"is_group": 0,
+		# 	"parent_item_group": _("All Item Groups"),
+		# 	"show_in_website": 1,
+		# },
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("Raw Material"),
+		# 	"is_group": 0,
+		# 	"parent_item_group": _("All Item Groups"),
+		# },
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("Services"),
+		# 	"is_group": 0,
+		# 	"parent_item_group": _("All Item Groups"),
+		# },
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("Sub Assemblies"),
+		# 	"is_group": 0,
+		# 	"parent_item_group": _("All Item Groups"),
+		# },
+		# {
+		# 	"doctype": "Item Group",
+		# 	"item_group_name": _("Consumable"),
+		# 	"is_group": 0,
+		# 	"parent_item_group": _("All Item Groups"),
+		# },
 		# Stock Entry Type
 		{"doctype": "Stock Entry Type", "name": "Material Issue", "purpose": "Material Issue"},
 		{"doctype": "Stock Entry Type", "name": "Material Receipt", "purpose": "Material Receipt"},
@@ -477,10 +477,10 @@ def update_stock_settings():
 	stock_settings = frappe.get_doc("Stock Settings")
 	stock_settings.item_naming_by = "Item Code"
 	stock_settings.valuation_method = "FIFO"
-	stock_settings.default_warehouse = frappe.db.get_value(
-		"Warehouse", {"warehouse_name": _("Stores")}
-	)
-	stock_settings.stock_uom = _("Nos")
+	# stock_settings.default_warehouse = frappe.db.get_value(
+	# 	"Warehouse", {"warehouse_name": _("Stores")}
+	# )
+	# stock_settings.stock_uom = _("Nos")
 	stock_settings.auto_indent = 1
 	stock_settings.auto_insert_price_list_rate_if_missing = 1
 	stock_settings.set_qty_in_transactions_based_on_serial_no_input = 1
