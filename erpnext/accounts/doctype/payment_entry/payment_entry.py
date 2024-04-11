@@ -1125,9 +1125,11 @@ class PaymentEntry(AccountsController):
 		else:
 			remarks = [
 				_("Amount {0} {1} {2} {3}").format(
-					_(self.party_account_currency),
+					_(self.paid_to_account_currency)
+					if self.payment_type == "Receive"
+					else _(self.paid_from_account_currency),
 					self.paid_amount if self.payment_type == "Receive" else self.received_amount,
-					_("received from") if self.payment_type == "Receive" else _("to"),
+					_("received from") if self.payment_type == "Receive" else _("paid to"),
 					self.party,
 				)
 			]
@@ -2132,8 +2134,7 @@ def get_party_details(company, party_type, party, date, cost_center=None):
 	if party_type in ["Customer", "Supplier"]:
 		party_bank_account = get_party_bank_account(party_type, party)
 
-	bank_account = get_default_company_bank_account(company)
-
+	bank_account = get_default_company_bank_account(company, party_type, party)
 	return {
 		"party_account": party_account,
 		"party_name": party_name,
