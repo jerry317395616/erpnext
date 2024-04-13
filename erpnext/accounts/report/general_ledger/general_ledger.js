@@ -210,6 +210,14 @@ frappe.query_reports["General Ledger"] = {
 			fieldtype: "Check",
 		},
 	],
+	formatter: function (value, row, column, data, default_formatter) {
+		value = default_formatter(value, row, column, data);
+		if (column.fieldname == "voucher_type") {
+			value = __(value)
+		}
+
+		return value;
+	},
 };
 
 erpnext.utils.add_dimensions("General Ledger", 15);
