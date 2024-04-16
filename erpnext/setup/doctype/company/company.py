@@ -273,7 +273,7 @@ class Company(NestedSet):
 				)
 				warehouse.flags.ignore_permissions = True
 				warehouse.flags.ignore_mandatory = True
-				# warehouse.insert()
+				warehouse.insert()
 
 	def create_default_accounts(self):
 		from erpnext.accounts.doctype.account.chart_of_accounts.chart_of_accounts import create_charts
