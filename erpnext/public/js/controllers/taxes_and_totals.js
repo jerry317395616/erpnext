@@ -465,7 +465,8 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 				((item.net_amount / this.frm.doc.net_total) * actual) : 0.0;
 
 		} else if(tax.charge_type == "On Net Total") {
-			current_tax_amount = (tax_rate / 100.0) * item.net_amount;
+			current_tax_amount = item.net_amount-(item.net_amount/(1+(tax_rate / 100.0)));
+			// current_tax_amount = (tax_rate / 100.0) * item.net_amount;
 		} else if(tax.charge_type == "On Previous Row Amount") {
 			current_tax_amount = (tax_rate / 100.0) *
 				this.frm.doc["taxes"][cint(tax.row_id) - 1].tax_amount_for_current_item;
