@@ -8,6 +8,7 @@ from pypika import functions as fn
 
 import erpnext
 from erpnext.accounts.doctype.account.test_account import get_inventory_account
+from erpnext.buying.doctype.supplier.test_supplier import create_supplier
 from erpnext.controllers.accounts_controller import InvalidQtyError
 from erpnext.controllers.buying_controller import QtyMismatchError
 from erpnext.stock import get_warehouse_account_map
@@ -3210,6 +3211,110 @@ class TestPurchaseReceipt(FrappeTestCase):
 		lcv.save().submit()
 		return lcv
 
+	def test_tax_account_heads_on_item_repost_without_lcv(self):
+		"""
+		PO -> PR -> PI
+		Backdated `Repost Item valuation` should not merge tax account heads into stock_rbnb if Purchase Receipt was created first
+		This scenario is without LCV
+		"""
+		from erpnext.accounts.doctype.account.test_account import create_account
+		from erpnext.buying.doctype.purchase_order.test_purchase_order import (
+			create_purchase_order,
+			make_pr_against_po,
+		)
+		from erpnext.stock.doctype.purchase_receipt.purchase_receipt import make_purchase_invoice
+
+		stock_rbnb = "Stock Received But Not Billed - _TC"
+		stock_in_hand = "Stock In Hand - _TC"
+		test_cc = "_Test Cost Center - _TC"
+		test_company = "_Test Company"
+		creditors = "Creditors - _TC"
+
+		company_doc = frappe.get_doc("Company", test_company)
+		company_doc.enable_perpetual_inventory = True
+		company_doc.stock_received_but_not_billed = stock_rbnb
+		company_doc.default_inventory_account = stock_in_hand
+		company_doc.save()
+
+		packaging_charges_account = create_account(
+			account_name="Packaging Charges",
+			parent_account="Indirect Expenses - _TC",
+			company=test_company,
+			account_type="Tax",
+		)
+
+		po = create_purchase_order(qty=10, rate=100, do_not_save=1)
+		po.taxes = []
+		po.append(
+			"taxes",
+			{
+				"category": "Valuation and Total",
+				"account_head": packaging_charges_account,
+				"cost_center": test_cc,
+				"description": "Test",
+				"add_deduct_tax": "Add",
+				"charge_type": "Actual",
+				"tax_amount": 250,
+			},
+		)
+		po.save().submit()
+
+		pr = make_pr_against_po(po.name, received_qty=10)
+		pr_gl_entries = get_gl_entries(pr.doctype, pr.name, skip_cancelled=True)
+		expected_pr_gles = [
+			{"account": stock_rbnb, "debit": 0.0, "credit": 1000.0, "cost_center": test_cc},
+			{"account": stock_in_hand, "debit": 1250.0, "credit": 0.0, "cost_center": test_cc},
+			{"account": packaging_charges_account, "debit": 0.0, "credit": 250.0, "cost_center": test_cc},
+		]
+		self.assertEqual(expected_pr_gles, pr_gl_entries)
+
+		# Make PI against Purchase Receipt
+		pi = make_purchase_invoice(pr.name).save().submit()
+		pi_gl_entries = get_gl_entries(pi.doctype, pi.name, skip_cancelled=True)
+		expected_pi_gles = [
+			{"account": stock_rbnb, "debit": 1000.0, "credit": 0.0, "cost_center": test_cc},
+			{"account": packaging_charges_account, "debit": 250.0, "credit": 0.0, "cost_center": test_cc},
+			{"account": creditors, "debit": 0.0, "credit": 1250.0, "cost_center": None},
+		]
+		self.assertEqual(expected_pi_gles, pi_gl_entries)
+
+		# Trigger Repost Item Valudation on a older date
+		repost_doc = frappe.get_doc(
+			{
+				"doctype": "Repost Item Valuation",
+				"based_on": "Item and Warehouse",
+				"item_code": pr.items[0].item_code,
+				"warehouse": pr.items[0].warehouse,
+				"posting_date": add_days(pr.posting_date, -1),
+				"posting_time": "00:00:00",
+				"company": pr.company,
+				"allow_negative_stock": 1,
+				"via_landed_cost_voucher": 0,
+				"allow_zero_rate": 0,
+			}
+		)
+		repost_doc.save().submit()
+
+		pr_gles_after_repost = get_gl_entries(pr.doctype, pr.name, skip_cancelled=True)
+		expected_pr_gles_after_repost = [
+			{"account": stock_rbnb, "debit": 0.0, "credit": 1000.0, "cost_center": test_cc},
+			{"account": stock_in_hand, "debit": 1250.0, "credit": 0.0, "cost_center": test_cc},
+			{"account": packaging_charges_account, "debit": 0.0, "credit": 250.0, "cost_center": test_cc},
+		]
+		self.assertEqual(len(pr_gles_after_repost), len(expected_pr_gles_after_repost))
+		self.assertEqual(expected_pr_gles_after_repost, pr_gles_after_repost)
+
+		# teardown
+		pi.reload()
+		pi.cancel()
+		pr.reload()
+		pr.cancel()
+
+		company_doc.enable_perpetual_inventory = False
+		company_doc.stock_received_but_not_billed = None
+		company_doc.default_inventory_account = None
+		company_doc.save()
+
 	def test_do_not_use_batchwise_valuation_rate(self):
 		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 
@@ -3268,6 +3373,138 @@ class TestPurchaseReceipt(FrappeTestCase):
 		doc.do_not_use_batchwise_valuation = 0
 		doc.flags.ignore_validate = True
 		doc.save()
+
+	def test_status_mapping(self):
+		item_code = "item_for_status"
+		create_item(item_code)
+		create_item("item_for_status")
+		warehouse = create_warehouse("Stores")
+		supplier = "Test Supplier"
+		create_supplier(supplier_name=supplier)
+		pr = make_purchase_receipt(
+			item_code=item_code,
+			warehouse=warehouse,
+			qty=1,
+			rate=0,
+		)
+		self.assertEqual(pr.grand_total, 0.0)
+		self.assertEqual(pr.status, "Completed")
+
+	def test_internal_transfer_for_batch_items_with_cancel(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
+		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+
+		frappe.db.set_single_value("Stock Settings", "use_serial_batch_fields", 0)
+
+		prepare_data_for_internal_transfer()
+
+		customer = "_Test Internal Customer 2"
+		company = "_Test Company with perpetual inventory"
+
+		batch_item_doc = make_item(
+			"_Test Batch Item For Stock Transfer Cancel Case",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "USBF-BT-CANBIFST-.####"},
+		)
+
+		serial_item_doc = make_item(
+			"_Test Serial No Item For Stock Transfer Cancel Case",
+			{"has_serial_no": 1, "serial_no_series": "USBF-BT-CANBIFST-.####"},
+		)
+
+		inward_entry = make_purchase_receipt(
+			item_code=batch_item_doc.name,
+			qty=10,
+			rate=150,
+			warehouse="Stores - TCP1",
+			company="_Test Company with perpetual inventory",
+			use_serial_batch_fields=0,
+			do_not_submit=1,
+		)
+
+		inward_entry.append(
+			"items",
+			{
+				"item_code": serial_item_doc.name,
+				"qty": 15,
+				"rate": 250,
+				"item_name": serial_item_doc.item_name,
+				"conversion_factor": 1.0,
+				"uom": serial_item_doc.stock_uom,
+				"stock_uom": serial_item_doc.stock_uom,
+				"warehouse": "Stores - TCP1",
+				"use_serial_batch_fields": 0,
+			},
+		)
+
+		inward_entry.submit()
+		inward_entry.reload()
+
+		for row in inward_entry.items:
+			self.assertTrue(row.serial_and_batch_bundle)
+
+		inter_transfer_dn = create_delivery_note(
+			item_code=inward_entry.items[0].item_code,
+			company=company,
+			customer=customer,
+			cost_center="Main - TCP1",
+			expense_account="Cost of Goods Sold - TCP1",
+			qty=10,
+			rate=500,
+			warehouse="Stores - TCP1",
+			target_warehouse="Work In Progress - TCP1",
+			batch_no=get_batch_from_bundle(inward_entry.items[0].serial_and_batch_bundle),
+			use_serial_batch_fields=0,
+			do_not_submit=1,
+		)
+
+		inter_transfer_dn.append(
+			"items",
+			{
+				"item_code": serial_item_doc.name,
+				"qty": 15,
+				"rate": 350,
+				"item_name": serial_item_doc.item_name,
+				"conversion_factor": 1.0,
+				"uom": serial_item_doc.stock_uom,
+				"stock_uom": serial_item_doc.stock_uom,
+				"warehouse": "Stores - TCP1",
+				"target_warehouse": "Work In Progress - TCP1",
+				"serial_no": "\n".join(
+					get_serial_nos_from_bundle(inward_entry.items[1].serial_and_batch_bundle)
+				),
+				"use_serial_batch_fields": 0,
+			},
+		)
+
+		inter_transfer_dn.submit()
+		inter_transfer_dn.reload()
+		for row in inter_transfer_dn.items:
+			if row.item_code == batch_item_doc.name:
+				self.assertEqual(row.rate, 150.0)
+			else:
+				self.assertEqual(row.rate, 250.0)
+
+			self.assertTrue(row.serial_and_batch_bundle)
+
+		inter_transfer_pr = make_inter_company_purchase_receipt(inter_transfer_dn.name)
+		for row in inter_transfer_pr.items:
+			row.from_warehouse = "Work In Progress - TCP1"
+			row.warehouse = "Stores - TCP1"
+		inter_transfer_pr.submit()
+
+		for row in inter_transfer_pr.items:
+			if row.item_code == batch_item_doc.name:
+				self.assertEqual(row.rate, 150.0)
+			else:
+				self.assertEqual(row.rate, 250.0)
+
+			self.assertTrue(row.serial_and_batch_bundle)
+
+		inter_transfer_pr.cancel()
+		inter_transfer_dn.cancel()
+
+		frappe.db.set_single_value("Stock Settings", "use_serial_batch_fields", 1)
 
 
 def prepare_data_for_internal_transfer():
@@ -3512,7 +3749,6 @@ def make_purchase_receipt(**args):
 		pr.insert()
 		if not args.do_not_submit:
 			pr.submit()
-
 		pr.load_from_db()
 
 	return pr

@@ -246,6 +246,9 @@ class SerialBatchBundle:
 			frappe.throw(_(msg))
 
 	def delink_serial_and_batch_bundle(self):
+		if self.is_pos_transaction():
+			return
+
 		update_values = {
 			"serial_and_batch_bundle": "",
 		}
@@ -295,7 +298,21 @@ class SerialBatchBundle:
 			self.cancel_serial_and_batch_bundle()
 
 	def cancel_serial_and_batch_bundle(self):
+		if self.is_pos_transaction():
+			return
+
 		frappe.get_cached_doc("Serial and Batch Bundle", self.sle.serial_and_batch_bundle).cancel()
+
+	def is_pos_transaction(self):
+		if (
+			self.sle.voucher_type == "Sales Invoice"
+			and self.sle.serial_and_batch_bundle
+			and frappe.get_cached_value(
+				"Serial and Batch Bundle", self.sle.serial_and_batch_bundle, "voucher_type"
+			)
+			== "POS Invoice"
+		):
+			return True
 
 	def submit_serial_and_batch_bundle(self):
 		doc = frappe.get_doc("Serial and Batch Bundle", self.sle.serial_and_batch_bundle)
@@ -599,9 +616,15 @@ class BatchNoValuation(DeprecatedBatchNoValuation):
 
 		timestamp_condition = ""
 		if self.sle.posting_date and self.sle.posting_time:
-			timestamp_condition = CombineDatetime(
-				parent.posting_date, parent.posting_time
-			) <= CombineDatetime(self.sle.posting_date, self.sle.posting_time)
+			timestamp_condition = CombineDatetime(parent.posting_date, parent.posting_time) < CombineDatetime(
+				self.sle.posting_date, self.sle.posting_time
+			)
+
+			if self.sle.creation:
+				timestamp_condition |= (
+					CombineDatetime(parent.posting_date, parent.posting_time)
+					== CombineDatetime(self.sle.posting_date, self.sle.posting_time)
+				) & (parent.creation < self.sle.creation)
 
 		query = (
 			frappe.qb.from_(parent)
