@@ -209,6 +209,11 @@ frappe.query_reports["General Ledger"] = {
 			label: __("Ignore Exchange Rate Revaluation Journals"),
 			fieldtype: "Check",
 		},
+		{
+			fieldname: "ignore_cr_dr_notes",
+			label: __("Ignore System Generated Credit / Debit Notes"),
+			fieldtype: "Check",
+		},
 	],
 	formatter: function (value, row, column, data, default_formatter) {
 		value = default_formatter(value, row, column, data);
