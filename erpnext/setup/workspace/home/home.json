@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"aCk49ShVRs\",\"type\":\"onboarding\",\"data\":{\"onboarding_name\":\"Home\",\"col\":12}},{\"id\":\"kb3XPLg8lb\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>快捷</b></span>\",\"col\":12}},{\"id\":\"nWd2KJPW8l\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Item\",\"col\":3}},{\"id\":\"snrzfbFr5Y\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Customer\",\"col\":3}},{\"id\":\"SHJKakmLLf\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Supplier\",\"col\":3}},{\"id\":\"CPxEyhaf3G\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Invoice\",\"col\":3}},{\"id\":\"WU4F-HUcIQ\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Leaderboard\",\"col\":3}},{\"id\":\"d_KVM1gsf9\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"JVu8-FJZCu\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>报表 &amp; 主数据</b></span>\",\"col\":12}},{\"id\":\"JiuSi0ubOg\",\"type\":\"card\",\"data\":{\"card_name\":\"Accounting\",\"col\":4}},{\"id\":\"ji2Jlm3Q8i\",\"type\":\"card\",\"data\":{\"card_name\":\"Stock\",\"col\":4}},{\"id\":\"N61oiXpuwK\",\"type\":\"card\",\"data\":{\"card_name\":\"CRM\",\"col\":4}},{\"id\":\"6J0CVl1mPo\",\"type\":\"card\",\"data\":{\"card_name\":\"Data Import and Settings\",\"col\":4}}]",
+ "content": "[{\"id\":\"kb3XPLg8lb\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>\u5feb\u6377</b></span>\",\"col\":12}},{\"id\":\"d_KVM1gsf9\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"nDDM9wfZOK\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"\u4e92\u8054\u7f51\u533b\u9662wiki\",\"col\":3}},{\"id\":\"a3w098vcB-\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"\u670d\u52a1\u5668\u4fe1\u606f\",\"col\":3}},{\"id\":\"VVZ8UVY1HZ\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"\u4ee3\u7801\u4fe1\u606f\",\"col\":3}},{\"id\":\"QZjtrbKOgo\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"\u9879\u76ee\u73af\u5883\u4fe1\u606f\",\"col\":3}},{\"id\":\"7TlmW0DwYs\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"\u9879\u76ee\u4fe1\u606f\",\"col\":3}}]",
  "creation": "2020-01-23 13:46:38.833076",
  "custom_blocks": [],
  "docstatus": 0,
@@ -12,14 +12,6 @@
  "is_hidden": 0,
  "label": "Home",
  "links": [
-  {
-   "hidden": 0,
-   "is_query_report": 0,
-   "label": "Accounting",
-   "link_count": 0,
-   "onboard": 0,
-   "type": "Card Break"
-  },
   {
    "dependencies": "",
    "hidden": 0,
@@ -63,14 +55,6 @@
    "link_type": "DocType",
    "onboard": 1,
    "type": "Link"
-  },
-  {
-   "hidden": 0,
-   "is_query_report": 0,
-   "label": "Stock",
-   "link_count": 0,
-   "onboard": 0,
-   "type": "Card Break"
   },
   {
    "dependencies": "",
@@ -128,14 +112,6 @@
    "type": "Link"
   },
   {
-   "hidden": 0,
-   "is_query_report": 0,
-   "label": "CRM",
-   "link_count": 0,
-   "onboard": 0,
-   "type": "Card Break"
-  },
-  {
    "dependencies": "",
    "hidden": 0,
    "is_query_report": 0,
@@ -167,14 +143,6 @@
    "link_type": "DocType",
    "onboard": 1,
    "type": "Link"
-  },
-  {
-   "hidden": 0,
-   "is_query_report": 0,
-   "label": "Data Import and Settings",
-   "link_count": 0,
-   "onboard": 0,
-   "type": "Card Break"
   },
   {
    "dependencies": "",
@@ -232,7 +200,7 @@
    "type": "Link"
   }
  ],
- "modified": "2023-05-24 14:47:18.765388",
+ "modified": "2024-06-28 15:48:15.208994",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Home",
@@ -246,29 +214,43 @@
  "sequence_id": 1.0,
  "shortcuts": [
   {
-   "label": "Item",
-   "link_to": "Item",
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "\u9879\u76ee\u4fe1\u606f",
+   "link_to": "Project Info",
+   "stats_filter": "[]",
    "type": "DocType"
   },
   {
-   "label": "Customer",
-   "link_to": "Customer",
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "\u4e92\u8054\u7f51\u533b\u9662wiki",
+   "type": "URL",
+   "url": "http://wellcare:8000/net-hos"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "\u670d\u52a1\u5668\u4fe1\u606f",
+   "link_to": "Server Info",
+   "stats_filter": "[]",
    "type": "DocType"
   },
   {
-   "label": "Supplier",
-   "link_to": "Supplier",
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "\u4ee3\u7801\u4fe1\u606f",
+   "link_to": "Code Info",
+   "stats_filter": "[]",
    "type": "DocType"
   },
   {
-   "label": "Sales Invoice",
-   "link_to": "Sales Invoice",
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "\u9879\u76ee\u73af\u5883\u4fe1\u606f",
+   "link_to": "Env Info",
+   "stats_filter": "[]",
    "type": "DocType"
-  },
-  {
-   "label": "Leaderboard",
-   "link_to": "leaderboard",
-   "type": "Page"
   }
  ],
  "title": "Home"
