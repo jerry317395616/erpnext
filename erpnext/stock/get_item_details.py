@@ -316,8 +316,6 @@ def set_valuation_rate(out: frappe._dict, ctx: frappe._dict):
 
 
 def update_stock(ctx, out, doc=None):
-	from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos_for_outward
-
 	if (
 		(
 			ctx.get("doctype") in ["Delivery Note", "POS Invoice"]
@@ -359,24 +357,31 @@ def update_stock(ctx, out, doc=None):
 				if rate:
 					out.update({"rate": rate, "price_list_rate": rate})
 
-		if out.has_serial_no and out.has_batch_no and has_incorrect_serial_nos(ctx, out):
-			batch_no = ctx.get("batch_no") or out.get("batch_no")
-			if batch_no:
-				kwargs["batches"] = [batch_no]
-			serial_nos = get_serial_nos_for_outward(kwargs)
-			serial_nos = get_filtered_serial_nos(serial_nos, doc)
+		if out.has_serial_no and needs_serial_nos(ctx, out):
+			set_serial_nos_for_outward(ctx, out, kwargs, doc)
 
-			out["serial_no"] = "\n".join(
-				SerialBatchIdentity("Serial No").get_numbers(ctx.item_code, serial_nos[: cint(out.stock_qty)])
-			)
 
-		elif out.has_serial_no and not ctx.get("serial_no"):
-			serial_nos = get_serial_nos_for_outward(kwargs)
-			serial_nos = get_filtered_serial_nos(serial_nos, doc)
+def needs_serial_nos(ctx, out):
+	if not out.has_batch_no:
+		return not ctx.get("serial_no")
 
-			out["serial_no"] = "\n".join(
-				SerialBatchIdentity("Serial No").get_numbers(ctx.item_code, serial_nos[: cint(out.stock_qty)])
-			)
+	if ctx.get("use_serial_batch_fields"):
+		return False
+
+	return has_incorrect_serial_nos(ctx, out)
+
+
+def set_serial_nos_for_outward(ctx, out, kwargs, doc):
+	from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos_for_outward
+
+	batch_no = ctx.get("batch_no") or out.get("batch_no")
+	if out.has_batch_no and batch_no:
+		kwargs["batches"] = [batch_no]
+
+	serial_nos = get_filtered_serial_nos(get_serial_nos_for_outward(kwargs), doc)
+	out["serial_no"] = "\n".join(
+		SerialBatchIdentity("Serial No").get_numbers(ctx.item_code, serial_nos[: cint(out.stock_qty)])
+	)
 
 
 def has_incorrect_serial_nos(ctx, out):
@@ -1115,11 +1120,9 @@ def get_default_discount_account(ctx: frappe._dict, item, item_group, brand):
 def get_default_deferred_account(ctx: frappe._dict, item, fieldname=None):
 	if item.get("enable_deferred_revenue") or item.get("enable_deferred_expense"):
 		return (
-			frappe.get_cached_value(
-				"Item Default",
-				{"parent": ctx.item_code, "company": ctx.company},
-				fieldname,
-			)
+			get_item_defaults(ctx.item_code, ctx.company).get(fieldname)
+			or get_item_group_defaults(ctx.item_code, ctx.company).get(fieldname)
+			or get_brand_defaults(ctx.item_code, ctx.company).get(fieldname)
 			or ctx.get(fieldname)
 			or frappe.get_cached_value("Company", ctx.company, "default_" + fieldname)
 		)
@@ -1231,6 +1234,30 @@ def get_price_list_rate(ctx: frappe._dict, item_doc, out: frappe._dict = None):
 	return out
 
 
+def get_item_prices_to_auto_update(ctx):
+	ip = frappe.qb.DocType("Item Price")
+	query = (
+		frappe.qb.from_(ip)
+		.select(ip.name, ip.price_list_rate, ip.valid_from, ip.valid_upto)
+		.where(
+			(ip.item_code == ctx.item_code)
+			& (ip.price_list == ctx.price_list)
+			& (ip.currency == ctx.currency)
+			& (ip.uom == ctx.stock_uom)
+		)
+	)
+
+	for fieldname in ("customer", "supplier", "batch_no"):
+		query = query.where(IfNull(ip[fieldname], "").isin(["", cstr(ctx.get(fieldname))]))
+		query = query.orderby(IfNull(ip[fieldname], ""), order=frappe.qb.desc)
+
+	return (
+		query.orderby(ip.valid_from.isnull(), order=frappe.qb.asc)
+		.orderby(ip.valid_from, order=frappe.qb.desc)
+		.orderby(ip.creation, order=frappe.qb.desc)
+	).run(as_dict=True)
+
+
 def insert_item_price(ctx: frappe._dict):
 	"""Insert Item Price if Price List and Price List Rate are specified and currency is the same"""
 	if not ctx.price_list or not ctx.rate or ctx.is_internal_supplier or ctx.is_internal_customer:
@@ -1250,20 +1277,7 @@ def insert_item_price(ctx: frappe._dict):
 		or getdate()
 	)
 
-	ip = frappe.qb.DocType("Item Price")
-	item_prices = (
-		frappe.qb.from_(ip)
-		.select(ip.name, ip.price_list_rate, ip.valid_from, ip.valid_upto)
-		.where(
-			(ip.item_code == ctx.item_code)
-			& (ip.price_list == ctx.price_list)
-			& (ip.currency == ctx.currency)
-			& (ip.uom == ctx.stock_uom)
-		)
-		.orderby(ip.valid_from.isnull(), order=frappe.qb.asc)
-		.orderby(ip.valid_from, order=frappe.qb.desc)
-		.orderby(ip.creation, order=frappe.qb.desc)
-	).run(as_dict=True)
+	item_prices = get_item_prices_to_auto_update(ctx)
 	item_price = next(
 		(
 			row
@@ -1344,7 +1358,9 @@ def _get_stock_uom_rate(rate: float, ctx: frappe._dict):
 	return rate / ctx.conversion_factor if ctx.conversion_factor else rate
 
 
-def get_item_price(pctx: frappe._dict, item_code, ignore_party=False, force_batch_no=False) -> list[dict]:
+def get_item_price(
+	pctx: frappe._dict, item_code, ignore_party=False, force_batch_no=False, limit=1
+) -> list[dict]:
 	"""
 	Get name, price_list_rate from Item Price based on conditions
 	        Check if the desired qty is within the increment of the packing list.
@@ -1355,18 +1371,16 @@ def get_item_price(pctx: frappe._dict, item_code, ignore_party=False, force_batc
 	ip = frappe.qb.DocType("Item Price")
 	query = (
 		frappe.qb.from_(ip)
-		.select(ip.name, ip.price_list_rate, ip.uom)
+		.select(ip.name, ip.price_list_rate, ip.uom, ip.packing_unit)
 		.where(
 			(ip.item_code == item_code)
 			& (ip.price_list == pctx.price_list)
 			& (IfNull(ip.uom, "").isin(["", pctx.uom]))
 		)
-		.orderby(ip.valid_from.isnull(), order=frappe.qb.asc)
-		.orderby(ip.valid_from, order=frappe.qb.desc)
-		.orderby(IfNull(ip.batch_no, ""), order=frappe.qb.desc)
-		.orderby(ip.uom, order=frappe.qb.desc)
-		.limit(1)
 	)
+
+	if limit:
+		query = query.limit(limit)
 
 	if force_batch_no:
 		query = query.where(ip.batch_no == pctx.batch_no)
@@ -1374,18 +1388,7 @@ def get_item_price(pctx: frappe._dict, item_code, ignore_party=False, force_batc
 		query = query.where(IfNull(ip.batch_no, "").isin(["", pctx.batch_no]))
 
 	if not ignore_party:
-		if pctx.customer:
-			query = query.where(
-				(ip.customer == pctx.customer)
-				| ((IfNull(ip.customer, "") == "") & (IfNull(ip.supplier, "") == ""))
-			).orderby(IfNull(ip.customer, ""), order=frappe.qb.desc)
-		elif pctx.supplier:
-			query = query.where(
-				(ip.supplier == pctx.supplier)
-				| ((IfNull(ip.customer, "") == "") & (IfNull(ip.supplier, "") == ""))
-			).orderby(IfNull(ip.supplier, ""), order=frappe.qb.desc)
-		else:
-			query = query.where((IfNull(ip.customer, "") == "") & (IfNull(ip.supplier, "") == ""))
+		query = apply_item_price_party_filter(query, ip, pctx)
 
 	if pctx.transaction_date:
 		query = query.where(
@@ -1393,11 +1396,35 @@ def get_item_price(pctx: frappe._dict, item_code, ignore_party=False, force_batc
 			& (IfNull(ip.valid_upto, "2500-12-31") >= pctx.transaction_date)
 		)
 
+	return apply_item_price_order(query, ip).run(as_dict=True)
+
+
+def apply_item_price_party_filter(query, ip, pctx):
+	without_party = (IfNull(ip.customer, "") == "") & (IfNull(ip.supplier, "") == "")
+
+	if pctx.customer:
+		return query.where((ip.customer == pctx.customer) | without_party).orderby(
+			IfNull(ip.customer, ""), order=frappe.qb.desc
+		)
+
+	if pctx.supplier:
+		return query.where((ip.supplier == pctx.supplier) | without_party).orderby(
+			IfNull(ip.supplier, ""), order=frappe.qb.desc
+		)
+
+	return query.where(without_party)
+
+
+def apply_item_price_order(query, ip):
 	# Final unique tiebreaker: rows tied on every sort key above (same valid_from/batch/uom/party)
 	# would otherwise be picked arbitrarily -- MariaDB and Postgres can differ. Pin the pick.
-	query = query.orderby(ip.name, order=frappe.qb.desc)
-
-	return query.run(as_dict=True)
+	return (
+		query.orderby(IfNull(ip.batch_no, ""), order=frappe.qb.desc)
+		.orderby(ip.valid_from.isnull(), order=frappe.qb.asc)
+		.orderby(ip.valid_from, order=frappe.qb.desc)
+		.orderby(ip.uom, order=frappe.qb.desc)
+		.orderby(ip.name, order=frappe.qb.desc)
+	)
 
 
 @frappe.whitelist()
@@ -1444,11 +1471,10 @@ def get_price_list_rate_for(ctx: ItemDetailsCtx, item_code: str):
 	)
 
 	item_price_data = 0
-	price_list_rate = get_item_price(pctx, item_code)
+	price_list_rate = get_item_price(pctx, item_code, limit=None)
 	if price_list_rate:
-		desired_qty = ctx.get("qty")
-		if desired_qty and check_packing_list(price_list_rate[0].name, desired_qty, item_code):
-			item_price_data = price_list_rate
+		if desired_qty := ctx.get("qty"):
+			item_price_data = get_prices_fitting_packing_unit(price_list_rate, desired_qty)
 	else:
 		general_price_list_rate = get_item_price(pctx, item_code, ignore_party=ctx.get("ignore_party"))
 
@@ -1466,6 +1492,14 @@ def get_price_list_rate_for(ctx: ItemDetailsCtx, item_code: str):
 			return flt(item_price_data[0].price_list_rate * flt(ctx.get("conversion_factor", 1)))
 		else:
 			return item_price_data[0].price_list_rate
+
+
+def get_prices_fitting_packing_unit(item_prices, desired_qty):
+	for item_price in item_prices:
+		if not item_price.packing_unit or flt(desired_qty) % flt(item_price.packing_unit) == 0:
+			return [item_price]
+
+	return []
 
 
 def check_packing_list(price_list_rate_name, desired_qty, item_code):
@@ -1834,9 +1868,9 @@ def get_price_list_currency_and_exchange_rate(ctx: frappe._dict):
 	if not ctx.price_list:
 		return {}
 
-	if ctx.doctype in ["Quotation", "Sales Order", "Delivery Note", "Sales Invoice"]:
+	if ctx.doctype in ["Quotation", "Sales Order", "Delivery Note", "Sales Invoice", "POS Invoice"]:
 		ctx.update({"exchange_rate": "for_selling"})
-	elif ctx.doctype in ["Purchase Order", "Purchase Receipt", "Purchase Invoice"]:
+	elif ctx.doctype in ["Supplier Quotation", "Purchase Order", "Purchase Receipt", "Purchase Invoice"]:
 		ctx.update({"exchange_rate": "for_buying"})
 
 	price_list_details = get_price_list_details(ctx.price_list)
@@ -1961,6 +1995,12 @@ def _get_blanket_order_details(ctx: ItemDetailsCtx):
 	if ctx.item_code:
 		bo = frappe.qb.DocType("Blanket Order")
 		bo_item = frappe.qb.DocType("Blanket Order Item")
+		allowance = flt(
+			frappe.db.get_single_value(
+				"Selling Settings" if ctx.doctype in ("Sales Order", "Quotation") else "Buying Settings",
+				"blanket_order_allowance",
+			)
+		)
 
 		query = (
 			frappe.qb.from_(bo)
@@ -1973,7 +2013,11 @@ def _get_blanket_order_details(ctx: ItemDetailsCtx):
 				& (bo.status != "Closed")
 				& (bo_item.closed == 0)
 				& (bo.name == bo_item.parent)
+				& (bo_item.ordered_qty < bo_item.qty * (1 + allowance / 100))
 			)
+			.orderby(bo.to_date)
+			.orderby(bo.name)
+			.limit(1)
 		)
 
 		if ctx.customer and ctx.doctype == "Sales Order":
@@ -1985,7 +2029,7 @@ def _get_blanket_order_details(ctx: ItemDetailsCtx):
 		if ctx.currency:
 			query = query.where(bo.currency == ctx.currency)
 		if ctx.transaction_date:
-			query = query.where(bo.to_date >= ctx.transaction_date)
+			query = query.where((bo.from_date <= ctx.transaction_date) & (bo.to_date >= ctx.transaction_date))
 
 		blanket_order_details = query.run(as_dict=True)
 		blanket_order_details = blanket_order_details[0] if blanket_order_details else ""

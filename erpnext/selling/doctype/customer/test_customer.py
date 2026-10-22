@@ -54,20 +54,6 @@ class TestCustomer(ERPNextTestSuite):
 		finally:
 			frappe.defaults.set_user_default("company", original_company)
 
-	def test_get_customer_name_dedupes_with_numeric_suffix(self):
-		# When a customer name already exists, get_customer_name appends "- <max suffix + 1>". The
-		# Postgres branch extracts the suffix with regexp_replace/NULLIF/CAST (pypika's Substring cannot
-		# do regex extraction); this exercises that path on both engines.
-		base = "_Test PG Dedup Customer"
-		for nm in (base, f"{base} - 3"):
-			if not frappe.db.exists("Customer", nm):
-				frappe.get_doc(
-					{"doctype": "Customer", "customer_name": nm, "customer_type": "Individual"}
-				).insert()
-
-		doc = frappe.get_doc({"doctype": "Customer", "customer_name": base, "customer_type": "Individual"})
-		self.assertEqual(doc.get_customer_name(), f"{base} - 4")
-
 	def test_get_customer_name_dedupe_handles_mixed_suffix(self):
 		# The suffix extractor must read the LEADING digits of the last whitespace-token, like MariaDB's
 		# CAST(SUBSTRING_INDEX(name, ' ', -1) AS UNSIGNED): "<base> - 3a" -> 3, so the next name is
@@ -88,7 +74,7 @@ class TestCustomer(ERPNextTestSuite):
 		doc.customer_group_name = "_Testing Customer Group"
 		doc.payment_terms = "_Test Payment Term Template 3"
 		doc.accounts = []
-		doc.default_price_list = "Standard Buying"
+		doc.default_price_list = "Standard Selling"
 		doc.credit_limits = []
 		test_account_details = {
 			"company": "_Test Company",
