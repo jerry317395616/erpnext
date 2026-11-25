@@ -94,6 +94,10 @@ class Supplier(TransactionBase):
 		"""Load address and contacts in `__onload`"""
 		load_address_and_contact(self)
 		self.load_dashboard_info()
+		self.set_onload(
+			"defer_overview",
+			not frappe.get_single_value("Buying Settings", "load_supplier_overview"),
+		)
 
 	def before_save(self):
 		if not self.on_hold:
@@ -161,10 +165,21 @@ class Supplier(TransactionBase):
 
 		validate_party_accounts(self)
 		validate_default_price_list_side(self.default_price_list, "buying")
+		self.validate_supplier_group()
 		self.validate_internal_supplier()
 		self.validate_primary_contact_and_address()
 		self.add_role_for_user()
 		self.validate_currency_for_receivable_payable_and_advance_account()
+
+	def validate_supplier_group(self):
+		if not self.supplier_group:
+			return
+
+		if frappe.db.get_value("Supplier Group", self.supplier_group, "is_group"):
+			frappe.throw(
+				_("Cannot select a Group type Supplier Group. Please select a non-group Supplier Group."),
+				title=_("Invalid Supplier Group"),
+			)
 
 	def validate_primary_contact_and_address(self):
 		for fieldname, link_doctype in (
@@ -192,7 +207,7 @@ class Supplier(TransactionBase):
 
 	@frappe.whitelist()
 	def get_supplier_group_details(self):
-		doc = frappe.get_doc("Supplier Group", self.supplier_group)
+		doc = frappe.get_doc("Supplier Group", self.supplier_group, check_permission="read")
 		self.payment_terms = ""
 		self.accounts = []
 

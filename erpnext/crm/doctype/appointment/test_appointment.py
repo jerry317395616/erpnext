@@ -82,6 +82,11 @@ def get_todo_statuses(appointment_name):
 	)
 
 
+def render_sent_email(sendmail):
+	kwargs = sendmail.call_args.kwargs
+	return frappe.render_template(f"templates/emails/{kwargs['template']}.html", kwargs["args"])
+
+
 def parse_verify_url(verify_url):
 	parsed = urlparse(verify_url)
 	return parsed, {key: value[0] for key, value in parse_qs(parsed.query).items()}
@@ -162,6 +167,26 @@ class TestAppointment(ERPNextTestSuite):
 			frappe.local.request = old_request
 			frappe.local.form_dict = old_form_dict
 			frappe.local.flags.commit = False
+
+	def test_verification_email_holds_no_guest_text(self):
+		self._configure_booking_settings()
+		guest_name = "Customer. Pay invoice INV-777 now at https://pay.example.com"
+		with self.set_user("Guest"), patch("frappe.sendmail") as sendmail:
+			appointment = create_appointment(
+				date=str(datetime.date.today() + datetime.timedelta(days=7)),
+				time="10:00:00",
+				tz="UTC",
+				contact={"name": guest_name, "email": "_test_appointment_mail@example.com"},
+			)
+
+		verification_email = render_sent_email(sendmail)
+		self.assertNotIn("pay.example.com", verification_email)
+		self.assertNotIn("INV-777", verification_email)
+		self.assertIn("/book_appointment/verify?key=", verification_email)
+
+		with patch("frappe.sendmail") as sendmail:
+			appointment.send_appointment_confirmed_email()
+		self.assertIn(guest_name, render_sent_email(sendmail))
 
 	def test_calendar_event_created(self):
 		cal_event = frappe.get_doc("Event", self.test_appointment.calendar_event)
@@ -627,6 +652,34 @@ class TestAppointment(ERPNextTestSuite):
 		first.status = "Open"
 		first.save()
 		self.assertTrue(all(status == "Open" for status in get_todo_statuses(first.name)))
+
+	def test_patch_shares_appointments_assigned_before_owner_only_access(self):
+		from frappe.desk.form.assign_to import add as add_assignment
+
+		from erpnext.patches.v16_0.share_assigned_appointments_with_agents import execute
+
+		agent_email = "appointment_employee_agent@example.com"
+		if not frappe.db.exists("User", agent_email):
+			frappe.get_doc({"doctype": "User", "email": agent_email, "first_name": "Employee Agent"}).insert(
+				ignore_permissions=True
+			)
+		frappe.get_doc("User", agent_email).add_roles("Employee")
+
+		appointment = create_test_appointment(customer_email="assigned_before@example.com")
+		# assigned while Employee could read every appointment, so it was not shared
+		add_assignment({"doctype": "Appointment", "name": appointment.name, "assign_to": [agent_email]})
+		frappe.db.delete("DocShare", {"share_doctype": "Appointment", "share_name": appointment.name})
+		# a closed ToDo drops the agent from _assign, but the agent still needs the appointment
+		todo = frappe.get_last_doc(
+			"ToDo", {"reference_type": "Appointment", "reference_name": appointment.name}
+		)
+		todo.status = "Closed"
+		todo.save(ignore_permissions=True)
+		self.assertNotIn(agent_email, frappe.db.get_value("Appointment", appointment.name, "_assign") or "")
+		self.assertFalse(frappe.has_permission("Appointment", doc=appointment.name, user=agent_email))
+
+		execute()
+		self.assertTrue(frappe.has_permission("Appointment", doc=appointment.name, user=agent_email))
 
 	def test_busy_agent_is_not_assigned_again(self):
 		from frappe.desk.form.assign_to import add as add_assignment

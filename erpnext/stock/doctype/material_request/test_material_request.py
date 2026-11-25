@@ -42,6 +42,22 @@ class TestMaterialRequest(ERPNextTestSuite):
 		mr.save()
 		self.assertEqual(mr.items[0].qty, 1)
 
+	def test_whole_number_stock_qty_must_not_be_fractional(self):
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.utilities.transaction_base import UOMMustBeIntegerError
+
+		item = make_item(properties={"stock_uom": "Nos"}, uoms=[{"uom": "Kg", "conversion_factor": 0.5}])
+
+		self.assertRaises(
+			UOMMustBeIntegerError,
+			make_material_request,
+			item_code=item.name,
+			qty=3,
+			uom="Kg",
+			conversion_factor=0.5,
+			do_not_submit=1,
+		)
+
 	def test_production_plan_qty_with_repeated_references(self):
 		from unittest.mock import patch
 
@@ -198,6 +214,7 @@ class TestMaterialRequest(ERPNextTestSuite):
 			mr.material_request_type = "Subcontracting"
 			mr.items = mr.items[:1]
 			mr.items[0].item_code = item.name
+			mr.items[0].uom = item.stock_uom
 			self.assertRaises(frappe.ValidationError, mr.insert)
 
 		frappe.db.set_value("Item", stock_item.name, "is_sub_contracted_item", 1)
@@ -624,7 +641,7 @@ class TestMaterialRequest(ERPNextTestSuite):
 				"item_name": "_Test FG Item",
 				"qty": 10,
 				"schedule_date": today(),
-				"uom": "_Test UOM 1",
+				"uom": "_Test UOM",
 				"warehouse": "_Test Warehouse - _TC",
 			},
 		)
@@ -1667,6 +1684,73 @@ class TestMaterialRequest(ERPNextTestSuite):
 		alerts = [m for m in frappe.get_message_log() if m.get("alert")]
 		self.assertTrue(any("was set to today" in m.get("message") for m in alerts))
 
+	def test_make_purchase_orders_by_supplier_fetches_supplier_price(self):
+		from erpnext.stock.doctype.material_request.mapper import make_purchase_orders_by_supplier
+
+		item_code = create_item("_Test MR Supplier Priced Item").name
+		mr = make_material_request_for_items([item_code])
+		self.assertFalse(mr.items[0].rate)
+
+		frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": "Standard Buying",
+				"supplier": "_Test Supplier",
+				"price_list_rate": 125,
+			}
+		).insert()
+
+		with self.change_settings("Buying Settings", {"buying_price_list": "Standard Buying"}):
+			purchase_orders = make_purchase_orders_by_supplier(
+				mr.name,
+				[
+					{
+						"material_request_item": mr.items[0].name,
+						"item_code": item_code,
+						"qty": 10,
+						"supplier": "_Test Supplier",
+					}
+				],
+			)
+
+		row = frappe.get_doc("Purchase Order", purchase_orders[0]).items[0]
+		self.assertEqual(row.price_list_rate, 125)
+		self.assertEqual(row.rate, 125)
+		self.assertEqual(row.amount, 1250)
+		self.assertEqual(row.material_request_item, mr.items[0].name)
+
+	def test_item_rates_refresh_only_on_price_list_change(self):
+		item_code = create_item("_Test MR Typed Rate Item").name
+		for price_list, rate in (("Standard Buying", 0.16), ("_Test Buying Price List", 9)):
+			frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"item_code": item_code,
+					"price_list": price_list,
+					"price_list_rate": rate,
+				}
+			).insert()
+
+		mr = frappe.new_doc("Material Request")
+		mr.update({"company": "_Test Company", "buying_price_list": "Standard Buying"})
+		mr.append(
+			"items",
+			{
+				"item_code": item_code,
+				"qty": 1,
+				"rate": 6,
+				"schedule_date": today(),
+				"warehouse": "_Test Warehouse - _TC",
+			},
+		)
+		mr.insert()
+		self.assertEqual(mr.items[0].rate, 6)
+
+		mr.buying_price_list = "_Test Buying Price List"
+		mr.save()
+		self.assertEqual(mr.items[0].rate, 9)
+
 	def test_make_purchase_orders_by_supplier_invalid_rows(self):
 		from erpnext.stock.doctype.material_request.mapper import make_purchase_orders_by_supplier
 
@@ -1875,6 +1959,34 @@ class TestMaterialRequest(ERPNextTestSuite):
 		update_status(mr.name, "Stopped")
 		self.assertRaises(frappe.InvalidStatusError, create_pick_list, mr.name)
 
+	def test_pick_list_maps_the_qty_left_after_a_transfer_and_an_open_pick(self):
+		from erpnext.stock.doctype.pick_list.mapper import create_stock_entry as make_se_from_pick_list
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry as make_se
+
+		item_code = create_item("_Test MR Open Pick Item", is_stock_item=1).name
+		make_se(item_code=item_code, target="_Test Warehouse - _TC", qty=20, basic_rate=100)
+		mr = make_material_request(
+			item_code=item_code,
+			material_request_type="Material Transfer",
+			from_warehouse="_Test Warehouse - _TC",
+			warehouse="_Test Warehouse 1 - _TC",
+			uom="Nos",
+		)
+
+		transfer = make_stock_entry(mr.name)
+		transfer.items[0].qty = 4
+		transfer.submit()
+
+		pick_list = create_pick_list(mr.name)
+		pick_list.locations[0].qty = pick_list.locations[0].stock_qty = 5
+		pick_list.submit()
+
+		# 4 transferred directly and 5 picked but not yet transferred
+		self.assertEqual(create_pick_list(mr.name).locations[0].qty, 1)
+
+		frappe.get_doc(make_se_from_pick_list(pick_list.as_json())).submit()
+		self.assertEqual(create_pick_list(mr.name).locations[0].qty, 1)
+
 	def test_mappers_skip_ordered_rows_and_stopped_requests(self):
 		mr = make_material_request(item_code="_Test Item", qty=10)
 		po = make_purchase_order(mr.name)
@@ -2032,6 +2144,65 @@ class TestMaterialRequest(ERPNextTestSuite):
 			},
 		)
 		self.assertIn(">30.0<", message)
+
+	def test_purchase_request_clears_source_warehouse(self):
+		mr = make_material_request(
+			from_warehouse="_Test Warehouse - _TC",
+			warehouse="_Test Warehouse - _TC",
+			do_not_submit=True,
+		)
+
+		self.assertIsNone(mr.items[0].from_warehouse)
+
+	def test_purchase_request_ignores_customer_item_restrictions(self):
+		from erpnext.selling.doctype.party_specific_item.test_party_specific_item import (
+			create_party_specific_item,
+		)
+
+		create_party_specific_item(
+			party_type="Customer",
+			party="_Test Customer",
+			restrict_based_on="Item",
+			based_on_value="_Test FG Item",
+		)
+		mr = make_material_request(do_not_submit=True)
+		mr.customer = "_Test Customer"
+		mr.save()
+
+		self.assertIsNone(mr.customer)
+
+	@ERPNextTestSuite.change_settings("Stock Settings", {"auto_indent": 1})
+	def test_variant_without_reorder_levels_is_reordered_from_its_template(self):
+		"""A variant with no re-order levels of its own uses its template's levels."""
+		from erpnext.controllers.item_variant import create_variant
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+		from erpnext.stock.reorder_item import reorder_item
+
+		template = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_variants": 1,
+				"attributes": [{"attribute": "Test Size"}],
+				"reorder_levels": [
+					{
+						"warehouse": "_Test Warehouse - _TC",
+						"warehouse_reorder_level": 20,
+						"warehouse_reorder_qty": 50,
+						"material_request_type": "Purchase",
+					}
+				],
+			}
+		).name
+		variant = create_variant(template, {"Test Size": "Large"})
+		variant.reorder_levels = []
+		variant.insert()
+		make_stock_entry(item_code=variant.name, target="_Test Warehouse - _TC", qty=5, basic_rate=10)
+
+		requests = reorder_item() or []
+
+		requested_qty = [d.stock_qty for mr in requests for d in mr.items if d.item_code == variant.name]
+		self.assertEqual(requested_qty, [50])
 
 
 def create_item_with_default_supplier(item_code, supplier):

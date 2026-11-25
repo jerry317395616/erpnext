@@ -56,6 +56,16 @@ class TestValuationPools(ERPNextTestSuite):
 		self.assertEqual(pool.issue(4, preferred_rate=120), 4 * 120)
 		self.assertEqual(pool.layers, [[10, 100], [6, 120]])
 
+	def test_lifo_return_takes_newest_layer_of_its_receipt_rate(self):
+		pool = QueuePool(last_in_first_out=True)
+		pool.receive(10, 100)
+		pool.receive(10, 120)
+		pool.receive(10, 100)
+		pool.receive(10, 150)
+
+		self.assertEqual(pool.issue(4, preferred_rate=100), 4 * 100)
+		self.assertEqual(pool.layers, [[10, 100], [10, 120], [6, 100], [10, 150]])
+
 	def test_queue_goes_negative_and_receipt_makes_up_the_shortfall(self):
 		pool = QueuePool()
 		pool.receive(5, 100)
@@ -245,6 +255,29 @@ class TestStockValuationComparison(ERPNextTestSuite):
 		)
 		self.assertEqual(self.run_report(item, show=SHOW_FIRST_DIFFERENCE)[0].stock_ledger_entry, count_in)
 
+	def test_standard_cost_serial_no_reconciliation_without_serial_no_wise_valuation(self):
+		from erpnext.stock.doctype.item_standard_cost.test_item_standard_cost import (
+			create_item_standard_cost,
+			create_standard_cost_item,
+		)
+
+		item = create_standard_cost_item(
+			has_serial_no=1, serial_no_series="SVC-SCR-.#####", use_serial_no_wise_valuation=0
+		).name
+		create_item_standard_cost(item, rate=100)
+		receipt = make_stock_entry(item_code=item, target=WAREHOUSE, qty=3, rate=100)
+
+		# counting two of three posts an outward and an inward bundle leg, each a movement
+		create_stock_reconciliation(
+			item_code=item,
+			warehouse=WAREHOUSE,
+			qty=2,
+			rate=100,
+			serial_no=get_serial_nos_of_entry(receipt)[:2],
+		)
+
+		self.assertNoDifferences(item)
+
 	def test_moving_average_with_fractional_rates_has_no_rounding_differences(self):
 		item = make_item(properties={"is_stock_item": 1, "valuation_method": "Moving Average"}).name
 
@@ -286,6 +319,22 @@ class TestStockValuationComparison(ERPNextTestSuite):
 		self.assertEqual(issue.stock_value_difference, -4 * 150)
 		self.assertEqual(issue.basis, BASIS_PURCHASE_RETURN)
 
+	def test_lifo_purchase_return_goes_out_at_the_returned_receipt_rate(self):
+		item = make_item(properties={"is_stock_item": 1, "valuation_method": "LIFO"}).name
+
+		first = make_purchase_receipt(item_code=item, warehouse=WAREHOUSE, qty=10, rate=100)
+		make_purchase_receipt(item_code=item, warehouse=WAREHOUSE, qty=10, rate=200)
+
+		purchase_return = make_purchase_return(first.name)
+		purchase_return.items[0].qty = -5
+		purchase_return.items[0].received_qty = -5
+		purchase_return.submit()
+
+		self.assertNoDifferences(item)
+
+		issue = get_expected_valuation(item, WAREHOUSE)[-1][1]
+		self.assertEqual(issue.stock_value_difference, -5 * 100)
+
 	def test_stock_reconciliation_sets_qty_and_rate(self):
 		item = make_item(properties={"is_stock_item": 1, "valuation_method": "FIFO"}).name
 
@@ -298,6 +347,14 @@ class TestStockValuationComparison(ERPNextTestSuite):
 		reconciliation, issue = (expected for _entry, expected in get_expected_valuation(item, WAREHOUSE)[1:])
 		self.assertEqual(reconciliation.stock_value, 6 * 130)
 		self.assertEqual(issue.stock_value_difference, -2 * 130)
+
+	def test_stock_reconciliation_rate_below_currency_precision(self):
+		item = make_item(properties={"is_stock_item": 1, "valuation_method": "FIFO"}).name
+
+		create_stock_reconciliation(item_code=item, warehouse=WAREHOUSE, qty=50000, rate=0.0001)
+
+		self.assertNoDifferences(item)
+		self.assertEqual(get_expected_valuation(item, WAREHOUSE)[-1][1].stock_value, 5)
 
 	def test_queries_do_not_grow_with_item_warehouses(self):
 		items = [

@@ -28,6 +28,8 @@ from erpnext.manufacturing.doctype.manufacturing_settings.manufacturing_settings
 )
 from erpnext.manufacturing.doctype.work_order.mapper import (
 	create_job_card,
+	get_operation_qty,
+	get_operation_target_qty,
 	split_qty_based_on_batch_size,
 )
 
@@ -37,6 +39,7 @@ _BOM_OPERATION_FIELDS = [
 	"workstation",
 	"idx",
 	"finished_good",
+	"finished_good_qty",
 	"is_subcontracted",
 	"wip_warehouse",
 	"source_warehouse",
@@ -72,10 +75,11 @@ class OperationsService:
 			self.doc.actual_operating_cost += flt(d.actual_operating_cost)
 
 		variable_cost = self.doc.actual_operating_cost or self.doc.planned_operating_cost
-		self.doc.total_operating_cost = (
+		self.doc.total_operating_cost = flt(
 			flt(self.doc.additional_operating_cost)
 			+ flt(variable_cost)
-			+ flt(self.doc.corrective_operation_cost)
+			+ flt(self.doc.corrective_operation_cost),
+			self.doc.precision("total_operating_cost"),
 		)
 
 	@staticmethod
@@ -118,15 +122,36 @@ class OperationsService:
 		plan_days = get_capacity_planning_days()
 
 		for idx, row in enumerate(self.doc.operations):
-			qty = self.doc.qty
+			qty = get_operation_qty(self.doc, row)
+			card_times = []
 			while qty > 0:
 				qty = split_qty_based_on_batch_size(self.doc, row, qty)
 				if row.job_card_qty > 0:
 					self.prepare_data_for_job_card(row, idx, plan_days, enable_capacity_planning)
+					card_times.append(
+						(get_datetime(row.planned_start_time), get_datetime(row.planned_end_time))
+					)
 
-		planned_end_date = self.doc.operations and self.doc.operations[-1].planned_end_time
-		if planned_end_date:
-			self.doc.db_set("planned_end_date", planned_end_date)
+			self.set_batch_operation_time(row, card_times)
+
+		# operations with the same Sequence ID run in parallel, so the last row may not end last
+		end_times = [
+			get_datetime(row.planned_end_time) for row in self.doc.operations if row.planned_end_time
+		]
+		if end_times:
+			self.doc.db_set("planned_end_date", max(end_times))
+
+	@staticmethod
+	def set_batch_operation_time(row, card_times):
+		"""Batch cards can be scheduled out of order, so the operation spans all of them."""
+		if len(card_times) < 2:
+			return
+
+		start = min(start for start, _end in card_times)
+		end = max(end for _start, end in card_times)
+		if (start, end) != card_times[-1]:
+			row.planned_start_time, row.planned_end_time = start, end
+			row.db_update()
 
 	def prepare_data_for_job_card(self, row, idx, plan_days, enable_capacity_planning):
 		self.set_operation_start_end_time(row, idx)
@@ -147,7 +172,7 @@ class OperationsService:
 		if schedule_blocks:
 			row.db_update()
 		elif enable_capacity_planning and job_card_doc:
-			row.planned_start_time = job_card_doc.scheduled_time_logs[-1].from_time
+			row.planned_start_time = job_card_doc.scheduled_time_logs[0].from_time
 			row.planned_end_time = job_card_doc.scheduled_time_logs[-1].to_time
 			self._validate_capacity_window(row, plan_days)
 			row.db_update()
@@ -157,7 +182,7 @@ class OperationsService:
 		if not (self.doc.production_plan and plan_row):
 			return []
 
-		if flt(row.job_card_qty) != flt(self.doc.qty):
+		if flt(row.job_card_qty) != get_operation_qty(self.doc, row):
 			return []
 
 		if sum(1 for d in self.doc.operations if d.operation == row.operation) > 1:
@@ -228,7 +253,13 @@ class OperationsService:
 	def set_work_order_operations(self):
 		"""Fetch operations from BOM and set in 'Work Order'"""
 		self.doc.set("operations", [])
-		if not self.doc.bom_no or not frappe.get_cached_value("BOM", self.doc.bom_no, "with_operations"):
+		if not self.doc.bom_no:
+			return
+
+		# With multi-level BOM, sub-assembly operations apply even when the top-level BOM has none
+		if not self.doc.use_multi_level_bom and not frappe.get_cached_value(
+			"BOM", self.doc.bom_no, "with_operations"
+		):
 			return
 
 		operations = self._collect_bom_operations()
@@ -247,6 +278,15 @@ class OperationsService:
 			self.doc.get_items_and_operations_from_bom()
 		elif flt(previous.qty) != flt(self.doc.qty) and flt(previous.qty):
 			self._scale_saved_operation_time(previous)
+			self._scale_saved_output_qty(previous)
+
+	def _scale_saved_output_qty(self, previous):
+		saved_rows = {row.name: row for row in previous.get("operations")}
+		for d in self.doc.get("operations"):
+			saved = saved_rows.get(d.name)
+			if saved and flt(saved.output_qty) and flt(saved.output_qty) == flt(d.output_qty):
+				output_qty = flt(saved.output_qty) * flt(self.doc.qty) / flt(previous.qty)
+				d.output_qty = flt(output_qty, d.precision("output_qty"))
 
 	def _scale_saved_operation_time(self, previous):
 		saved_rows = {row.name: row for row in previous.get("operations")}
@@ -261,7 +301,6 @@ class OperationsService:
 			if not saved or is_fixed or flt(saved.time_in_mins) != flt(d.time_in_mins):
 				continue
 			d.time_in_mins = flt(saved.time_in_mins) * flt(self.doc.qty) / flt(previous.qty)
-		self.calculate_operating_cost()
 
 	def _get_fixed_time_flags(self):
 		boms = {d.bom or self.doc.bom_no for d in self.doc.get("operations")}
@@ -310,7 +349,7 @@ class OperationsService:
 		groups.append((self._bom_operations(self.doc.bom_no), bom_qty, 1, False))
 
 		all_rows = [d for rows, _qty, _units, _exploded in groups for d in rows]
-		batch_size_flags = self._get_batch_size_flags(d.operation for d in all_rows)
+		batch_size_flags = get_batch_size_flags(d.operation for d in all_rows)
 
 		operations = []
 		for rows, qty, units, exploded in groups:
@@ -324,27 +363,25 @@ class OperationsService:
 			"BOM Operation", filters={"parent": bom_no}, fields=_BOM_OPERATION_FIELDS, order_by="idx"
 		)
 
-	def _get_batch_size_flags(self, operation_names):
-		names = {name for name in operation_names if name}
-		if not names:
-			return {}
-		return dict(
-			frappe.get_all(
-				"Operation",
-				filters={"name": ["in", list(names)]},
-				fields=["name", "create_job_card_based_on_batch_size"],
-				as_list=True,
-				limit_page_length=0,
-			)
-		)
-
 	def _adjust_operation_row(self, d, qty, units, exploded, batch_size_flags):
 		if not d.fixed_time:
-			d.time_in_mins = _operation_time_per_unit(d, qty, units, exploded, batch_size_flags)
+			d.time_in_mins = get_operation_time_per_unit(d, qty, units, exploded, batch_size_flags)
 
 		d.status = "Pending"
+		d.output_qty = self._operation_output_qty(d, qty, exploded)
 		if self.doc.track_semi_finished_goods and not d.sequence_id:
 			d.sequence_id = d.idx
+
+	def _operation_output_qty(self, d, qty, exploded):
+		finished_good_qty = flt(d.pop("finished_good_qty", 0))
+		if not (finished_good_qty and flt(qty) and d.finished_good):
+			return 0
+
+		if d.finished_good == self.doc.production_item:
+			return 0
+
+		per_unit = finished_good_qty * flt(qty) if exploded else finished_good_qty / flt(qty)
+		return flt(per_unit * flt(self.doc.qty), self.doc.precision("output_qty", "operations"))
 
 	def calculate_time(self):
 		for d in self.doc.get("operations"):
@@ -386,16 +423,18 @@ class OperationsService:
 		allowance_percentage = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order")
 		)
-		max_allowed_qty_for_wo = flt(self.doc.qty) + (allowance_percentage / 100 * flt(self.doc.qty))
+		operation_qty = get_operation_qty(self.doc, d)
+		max_allowed_qty_for_wo = operation_qty + (allowance_percentage / 100 * operation_qty)
 
 		if self._operation_qty(d) > flt(max_allowed_qty_for_wo, d.precision("completed_qty")):
 			frappe.throw(_("Completed Qty cannot be greater than 'Qty to Manufacture'"))
 
 	def _operation_status(self, d):
 		qty = self._operation_qty(d)
-		if not qty:
+		operation_qty = get_operation_target_qty(self.doc, d)
+		if not qty and operation_qty:
 			return "Pending"
-		if qty < flt(self.doc.qty, d.precision("completed_qty")):
+		if qty < operation_qty:
 			return "Work in Progress"
 		return "Completed"
 
@@ -450,8 +489,9 @@ class OperationsService:
 			)
 
 
-def _operation_time_per_unit(d, qty, units, exploded, batch_size_flags):
-	if batch_size_flags.get(d.operation) and flt(d.batch_size):
+def get_operation_time_per_unit(d, qty, units, exploded, batch_size_flags):
+	is_per_batch = batch_size_flags.get(d.operation) or d.set_cost_based_on_bom_qty
+	if is_per_batch and flt(d.batch_size):
 		return d.time_in_mins * flt(units) / flt(d.batch_size)
 	return d.time_in_mins * flt(qty) if exploded else d.time_in_mins / flt(qty)
 
@@ -459,3 +499,18 @@ def _operation_time_per_unit(d, qty, units, exploded, batch_size_flags):
 @frappe.request_cache
 def get_hour_rate(workstation):
 	return frappe.get_cached_value("Workstation", workstation, "hour_rate") or 0.0
+
+
+def get_batch_size_flags(operation_names):
+	names = {name for name in operation_names if name}
+	if not names:
+		return {}
+	return dict(
+		frappe.get_all(
+			"Operation",
+			filters={"name": ["in", list(names)]},
+			fields=["name", "create_job_card_based_on_batch_size"],
+			as_list=True,
+			limit_page_length=0,
+		)
+	)

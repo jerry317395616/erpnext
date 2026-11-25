@@ -31,6 +31,9 @@ class StatusService:
 		doc = self.doc
 		self.check_modified_date()
 
+		if status == "Closed":
+			self._validate_no_reserved_stock()
+
 		if status != "Closed" and doc.status == "Closed":
 			validate_parent_reopen(doc)
 			validate_reopen_against_blanket_order(doc)
@@ -41,10 +44,23 @@ class StatusService:
 		if status == "Draft" and doc.docstatus == 1:
 			doc.check_credit_limit()
 		doc.update_reserved_qty()
-		SubcontractingService(doc).update_subcontracting_order_status()
+		# hold and reopen leave the inward orders as they are: a user may have closed them on purpose
+		if status == "Closed":
+			SubcontractingService(doc).close_inward_orders()
 		doc.notify_update()
 		clear_doctype_notifications(doc)
 		doc.update_blanket_order()
+
+	def _validate_no_reserved_stock(self) -> None:
+		"""Closing must not strand reserved stock; the user unreserves it deliberately (like row close)."""
+		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import has_reserved_stock
+
+		if has_reserved_stock(self.doc.doctype, self.doc.name):
+			frappe.throw(
+				_("Sales Order {0} has reserved stock. Unreserve it before closing.").format(
+					frappe.bold(self.doc.name)
+				)
+			)
 
 	def recalculate_after_item_close(self) -> None:
 		"""Refresh progress after row flags changed.

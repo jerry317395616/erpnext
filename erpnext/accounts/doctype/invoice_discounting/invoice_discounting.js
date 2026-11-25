@@ -52,6 +52,8 @@ frappe.ui.form.on("Invoice Discounting", {
 
 	refresh: (frm) => {
 		frm.events.show_general_ledger(frm);
+		erpnext.accounts.show_payment_ledger(frm);
+		erpnext.accounts.ledger_preview.show_payment_ledger_preview(frm);
 
 		if (frm.doc.docstatus === 0) {
 			frm.add_custom_button(__("Get Invoices"), function () {
@@ -61,14 +63,24 @@ frappe.ui.form.on("Invoice Discounting", {
 
 		if (frm.doc.docstatus === 1 && frm.doc.status !== "Settled") {
 			if (frm.doc.status == "Sanctioned") {
-				frm.add_custom_button(__("Disburse Loan"), function () {
-					frm.events.create_disbursement_entry(frm);
-				}).addClass("btn-primary");
+				frm.add_custom_button(
+					__("Disburse Loan"),
+					function () {
+						frm.events.create_disbursement_entry(frm);
+					},
+					null,
+					"primary"
+				);
 			}
 			if (frm.doc.status == "Disbursed") {
-				frm.add_custom_button(__("Close Loan"), function () {
-					frm.events.close_loan(frm);
-				}).addClass("btn-primary");
+				frm.add_custom_button(
+					__("Close Loan"),
+					function () {
+						frm.events.close_loan(frm);
+					},
+					null,
+					"primary"
+				);
 			}
 		}
 	},

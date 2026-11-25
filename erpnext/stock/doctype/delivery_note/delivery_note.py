@@ -213,38 +213,48 @@ class DeliveryNote(SellingController):
 				where name=`tabSales Invoice Item`.parent and update_stock = 1)""",
 			},
 		]
-		if cint(self.is_return):
-			self.status_updater.extend(
-				[
-					{
-						"source_dt": "Delivery Note Item",
-						"target_dt": "Sales Order Item",
-						"join_field": "so_detail",
-						"target_field": "returned_qty",
-						"target_parent_dt": "Sales Order",
-						"source_field": "-1 * qty * conversion_factor",
-						"target_conversion_factor": "conversion_factor",
-						"second_source_dt": "Sales Invoice Item",
-						"second_source_field": "-1 * qty * conversion_factor",
-						"second_join_field": "so_detail",
-						"extra_cond": """ and exists (select name from `tabDelivery Note`
-					where name=`tabDelivery Note Item`.parent and is_return=1)""",
-						"second_source_extra_cond": """ and exists (select name from `tabSales Invoice`
-					where name=`tabSales Invoice Item`.parent and is_return=1 and update_stock=1)""",
-					},
-					{
-						"source_dt": "Delivery Note Item",
-						"target_dt": "Delivery Note Item",
-						"join_field": "dn_detail",
-						"target_field": "returned_qty",
-						"target_parent_dt": "Delivery Note",
-						"target_parent_field": "per_returned",
-						"target_ref_field": "stock_qty",
-						"source_field": "-1 * stock_qty",
-						"percent_join_field_parent": "return_against",
-					},
-				]
-			)
+
+	def update_status_updater_args(self):
+		"""Attach return updaters at submit/cancel, since `make_return_doc` sets `is_return` after `__init__`."""
+		# guard against a second append when one object is submitted and then cancelled
+		if not cint(self.is_return) or self.flags.get("return_updaters_added"):
+			return
+
+		self.flags.return_updaters_added = True
+		self.status_updater.extend(
+			[
+				{
+					"source_dt": "Delivery Note Item",
+					"target_dt": "Sales Order Item",
+					"join_field": "so_detail",
+					"target_field": "returned_qty",
+					"target_parent_dt": "Sales Order",
+					"source_field": "-1 * qty * conversion_factor",
+					"target_conversion_factor": "conversion_factor",
+					"second_source_dt": "Sales Invoice Item",
+					"second_source_field": "-1 * qty * conversion_factor",
+					"second_join_field": "so_detail",
+					"extra_cond": """ and exists (select name from `tabDelivery Note`
+				where name=`tabDelivery Note Item`.parent and is_return=1)""",
+					"second_source_extra_cond": """ and exists (select name from `tabSales Invoice`
+				where name=`tabSales Invoice Item`.parent and is_return=1 and update_stock=1)""",
+				},
+				{
+					"source_dt": "Delivery Note Item",
+					"target_dt": "Delivery Note Item",
+					"join_field": "dn_detail",
+					"target_field": "returned_qty",
+					"target_parent_dt": "Delivery Note",
+					"target_parent_field": "per_returned",
+					"target_ref_field": "stock_qty",
+					"source_field": "-1 * qty * conversion_factor",
+					"round_to_target_precision": frappe.get_single_value(
+						"Stock Settings", "allow_to_edit_stock_uom_qty_for_sales"
+					),
+					"percent_join_field_parent": "return_against",
+				},
+			]
+		)
 
 	def onload(self):
 		super().onload()
@@ -300,6 +310,7 @@ class DeliveryNote(SellingController):
 		self.validate_uom_is_integer("stock_uom", "stock_qty")
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_with_previous_doc()
+		self.validate_against_pick_list_items()
 		self.set_serial_and_batch_bundle_from_pick_list()
 		make_packing_list(self)
 		self.update_current_stock()
@@ -392,7 +403,6 @@ class DeliveryNote(SellingController):
 		if (
 			cint(frappe.get_single_value("Selling Settings", "maintain_same_sales_rate"))
 			and not self.is_return
-			and not self.is_internal_customer
 		):
 			self.validate_rate_with_reference_doc(
 				[
@@ -541,6 +551,7 @@ class DeliveryNote(SellingController):
 		)
 
 		# update delivered qty in sales order
+		self.update_status_updater_args()
 		self.update_prevdoc_status()
 		self.update_pick_list_status()
 		self.update_billing_status()
@@ -558,6 +569,8 @@ class DeliveryNote(SellingController):
 			self.make_bundle_using_old_serial_batch_fields(table_name)
 
 		self.validate_standalone_serial_nos_customer()
+		# reservations read the delivered serial and batch nos from the bundles
+		self.make_packed_item_bundles()
 		self.update_stock_reservation_entries()
 
 		# Updating stock ledger should always be called after updating prevdoc status,
@@ -573,6 +586,7 @@ class DeliveryNote(SellingController):
 		self.check_sales_order_on_hold_or_close("against_sales_order")
 		self.check_next_docstatus()
 
+		self.update_status_updater_args()
 		self.update_prevdoc_status()
 		self.update_billing_status()
 
@@ -599,27 +613,26 @@ class DeliveryNote(SellingController):
 		self.delete_auto_created_batches()
 
 	def check_credit_limit(self):
-		from erpnext.selling.doctype.customer.customer import check_credit_limit
+		from erpnext.selling.doctype.customer.customer import (
+			check_credit_limit,
+			is_sales_order_credit_check_bypassed,
+		)
 
 		if self.per_billed == 100:
 			return
 
 		extra_amount = 0
 		validate_against_credit_limit = False
-		bypass_credit_limit_check_at_sales_order = cint(
-			frappe.db.get_value(
-				"Customer Credit Limit",
-				filters={"parent": self.customer, "parenttype": "Customer", "company": self.company},
-				fieldname="bypass_credit_limit_check",
-			)
+		bypass_credit_limit_check_at_sales_order = is_sales_order_credit_check_bypassed(
+			self.customer, self.company
 		)
 
 		if bypass_credit_limit_check_at_sales_order:
 			for d in self.get("items"):
 				if not d.against_sales_invoice:
 					validate_against_credit_limit = True
-					# Only submitted standalone rows are already included in customer outstanding.
-					if (d.against_sales_order or self.docstatus == 0) and self.base_net_total:
+					# Submitted rows are already in customer outstanding, directly or via the Sales Order.
+					if self.docstatus == 0 and self.base_net_total:
 						extra_amount += d.base_net_amount / self.base_net_total * self.base_grand_total
 			if validate_against_credit_limit and not self.base_net_total:
 				# Customer outstanding excludes zero-net deliveries, including their freight charges.

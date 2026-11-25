@@ -7,16 +7,21 @@ from graphlib import TopologicalSorter
 import frappe
 from email_reply_parser import EmailReplyParser
 from frappe import _, qb
+from frappe.email.email_body import get_message_id
 from frappe.model.document import Document
-from frappe.query_builder import Case, Interval
-from frappe.query_builder.functions import Count, CurDate, Date, Locate, Lower, Sum, UnixTimestamp
+from frappe.query_builder import Case
+from frappe.query_builder.functions import Count, Date, Locate, Lower, Sum, UnixTimestamp
 from frappe.utils import (
 	add_days,
+	add_years,
 	create_batch,
 	flt,
 	get_datetime,
 	get_link_to_form,
+	get_string_between,
 	get_time,
+	getdate,
+	nowdate,
 	nowtime,
 	today,
 )
@@ -26,16 +31,8 @@ from pypika import Order
 
 from erpnext import get_default_company
 from erpnext.controllers.website_list_for_contact import get_customers_suppliers
+from erpnext.projects.doctype.project.costing.queries import CONSUMPTION_VOUCHER_TYPES, ProjectCostQueries
 from erpnext.setup.doctype.holiday_list.holiday_list import is_holiday
-
-CONSUMPTION_VOUCHER_TYPES = ("Stock Entry", "Delivery Note", "Sales Invoice")
-
-LANDED_COST_RECEIPT_ITEMS = (
-	"Purchase Receipt Item",
-	"Purchase Invoice Item",
-	"Subcontracting Receipt Item",
-	"Stock Entry Detail",
-)
 
 PORTAL_LIST_FIELDS = ["name", "project_name", "status", "percent_complete", "_assign", "modified"]
 
@@ -156,6 +153,7 @@ class Project(Document):
 				project_tasks.append(task)
 
 			self.dependency_mapping(tmp_task_details, project_tasks)
+			self.reschedule_tasks_moved_by_holidays(tmp_task_details, project_tasks)
 
 	def create_task_from_template(self, task_details):
 		return frappe.get_doc(
@@ -173,6 +171,8 @@ class Project(Document):
 			color=task_details.color,
 			template_task=task_details.name,
 			priority=task_details.priority,
+			expected_time=task_details.expected_time,
+			is_milestone=task_details.is_milestone,
 		).insert()
 
 	def calculate_start_date(self, task_details):
@@ -199,43 +199,20 @@ class Project(Document):
 			self.check_depends_on_value(template_task, project_task, project_tasks)
 			self.check_for_parent_tasks(template_task, project_task, project_tasks)
 
+	def reschedule_tasks_moved_by_holidays(self, template_tasks, project_tasks):
+		"""A holiday can push a task past the start of a task that depends on it."""
+		for template_task, project_task in zip(template_tasks, project_tasks, strict=True):
+			start_date = getdate(add_days(self.expected_start_date, template_task.start))
+			end_date = add_days(start_date, template_task.duration)
+			if (
+				getdate(project_task.exp_start_date) != start_date
+				or getdate(project_task.exp_end_date) != end_date
+			):
+				project_task.reload()
+				project_task.reschedule_dependent_tasks()
+
 	def set_consumed_material_cost(self):
-		self.total_consumed_material_cost = (
-			self.get_stock_value_consumed() + self.get_stock_entry_capitalised_costs()
-		)
-
-	def get_stock_value_consumed(self) -> float:
-		sle = qb.DocType("Stock Ledger Entry")
-		stock_entry = qb.DocType("Stock Entry")
-		value_change = (
-			qb.from_(sle)
-			.left_join(stock_entry)
-			.on((sle.voucher_type == "Stock Entry") & (stock_entry.name == sle.voucher_no))
-			.select(Sum(sle.stock_value_difference))
-			.where(
-				(sle.project == self.name)
-				& (sle.is_cancelled == 0)
-				& sle.voucher_type.isin(CONSUMPTION_VOUCHER_TYPES)
-				& (stock_entry.purpose.isnull() | (stock_entry.purpose != "Material Receipt"))
-			)
-		).run()
-		return -flt(value_change[0][0])
-
-	def get_stock_entry_capitalised_costs(self) -> float:
-		stock_entry = qb.DocType("Stock Entry")
-		stock_entry_item = qb.DocType("Stock Entry Detail")
-		amount = (
-			qb.from_(stock_entry_item)
-			.join(stock_entry)
-			.on(stock_entry.name == stock_entry_item.parent)
-			.select(Sum(stock_entry_item.additional_cost + stock_entry_item.landed_cost_voucher_amount))
-			.where(
-				(stock_entry_item.project == self.name)
-				& (stock_entry.docstatus == 1)
-				& (stock_entry.purpose != "Material Receipt")
-			)
-		).run()
-		return flt(amount[0][0])
+		self.total_consumed_material_cost = ProjectCostQueries(self.name).material_cost()
 
 	def check_depends_on_value(self, template_task, project_task, project_tasks):
 		if template_task.get("depends_on") and not project_task.get("depends_on"):
@@ -253,9 +230,23 @@ class Project(Document):
 		if template_task.get("parent_task") and not project_task.get("parent_task"):
 			for pt in project_tasks:
 				if pt.template_task == template_task.parent_task:
+					self.extend_group_to_cover(pt, project_task.exp_end_date, project_tasks)
 					project_task.parent_task = pt.name
 					project_task.save()
 					break
+
+	def extend_group_to_cover(self, group, end_date, project_tasks):
+		"""A holiday can push a child task past the end of its group, so the group ends later too."""
+		if not end_date or not group.exp_end_date or getdate(end_date) <= getdate(group.exp_end_date):
+			return
+
+		group.reload()
+		if group.parent_task:
+			parent_group = next(pt for pt in project_tasks if pt.name == group.parent_task)
+			self.extend_group_to_cover(parent_group, end_date, project_tasks)
+
+		group.exp_end_date = end_date
+		group.save()
 
 	def is_row_updated(self, row, existing_task_data, fields):
 		if self.get("__islocal") or not existing_task_data:
@@ -426,87 +417,13 @@ class Project(Document):
 		)
 
 	def update_purchase_costing(self):
-		self.total_purchase_cost = self.get_non_stock_purchase_cost() - self.get_capitalised_landed_cost()
-
-	def get_non_stock_purchase_cost(self) -> float:
-		invoice_item = qb.DocType("Purchase Invoice Item")
-		item = qb.DocType("Item")
-		purchase_order = qb.DocType("Purchase Order")
-		amount = (
-			qb.from_(invoice_item)
-			.left_join(item)
-			.on(item.name == invoice_item.item_code)
-			.left_join(purchase_order)
-			.on(purchase_order.name == invoice_item.purchase_order)
-			.select(Sum(invoice_item.base_net_amount))
-			.where(
-				(invoice_item.project == self.name)
-				& (invoice_item.docstatus == 1)
-				& (
-					item.is_stock_item.isnull()
-					| (item.is_stock_item == 0)
-					| (invoice_item.delivered_by_supplier == 1)
-				)
-				& (purchase_order.is_subcontracted.isnull() | (purchase_order.is_subcontracted == 0))
-			)
-		).run()
-		return flt(amount[0][0])
-
-	def get_capitalised_landed_cost(self) -> float:
-		amount = 0
-		for doctype in LANDED_COST_RECEIPT_ITEMS:
-			receipt_item = qb.DocType(doctype)
-			charges = (
-				qb.from_(receipt_item)
-				.select(Sum(receipt_item.landed_cost_voucher_amount))
-				.where((receipt_item.project == self.name) & (receipt_item.docstatus == 1))
-			).run()
-			amount += flt(charges[0][0])
-		return amount
+		self.total_purchase_cost = ProjectCostQueries(self.name).purchase_cost()
 
 	def update_sales_amount(self):
-		so = frappe.qb.DocType("Sales Order")
-		total_sales_amount = (
-			frappe.qb.from_(so)
-			.select(Sum(so.base_net_total))
-			.where((so.project == self.name) & (so.docstatus == 1))
-			.run()
-		)
-
-		self.total_sales_amount = total_sales_amount and total_sales_amount[0][0] or 0
+		self.total_sales_amount = ProjectCostQueries(self.name).sales_order_amount()
 
 	def update_billed_amount(self):
-		self.total_billed_amount = self.get_billed_amount_from_parent() + self.get_billed_amount_from_child()
-
-	def get_billed_amount_from_parent(self):
-		si = frappe.qb.DocType("Sales Invoice")
-		si_item = frappe.qb.DocType("Sales Invoice Item")
-		total_billed_amount = (
-			frappe.qb.from_(si)
-			.join(si_item)
-			.on(si_item.parent == si.name)
-			.select(Sum(si_item.base_net_amount))
-			.where(
-				si_item.project.isnull()
-				& si.project.isnotnull()
-				& (si.project == self.name)
-				& (si.docstatus == 1)
-			)
-			.run()
-		)
-
-		return total_billed_amount and total_billed_amount[0][0] or 0
-
-	def get_billed_amount_from_child(self):
-		si_item = frappe.qb.DocType("Sales Invoice Item")
-		total_billed_amount = (
-			frappe.qb.from_(si_item)
-			.select(Sum(si_item.base_net_amount))
-			.where((si_item.project == self.name) & (si_item.docstatus == 1))
-			.run()
-		)
-
-		return total_billed_amount and total_billed_amount[0][0] or 0
+		self.total_billed_amount = ProjectCostQueries(self.name).billed_amount()
 
 	def after_rename(self, old_name, new_name, merge=False):
 		if old_name == self.copied_from:
@@ -574,7 +491,7 @@ def get_timeline_data(doctype: str, name: str) -> dict[int, int]:
 		frappe.qb.from_(timesheet_detail)
 		.select(UnixTimestamp(Date(timesheet_detail.from_time)), Count("*"))
 		.where(timesheet_detail.project == name)
-		.where(timesheet_detail.from_time > CurDate() - Interval(years=1))
+		.where(timesheet_detail.from_time > add_years(nowdate(), -1))
 		.where(timesheet_detail.docstatus < 2)
 		.groupby(Date(timesheet_detail.from_time))
 		.run()
@@ -842,13 +759,38 @@ def send_project_update_email_to_users(project):
 		"Email Account", dict(enable_incoming=1, default_incoming=1), "email_id"
 	)
 
+	for recipient in get_users_email(doc):
+		send_project_update_copy(doc, project_update, recipient, incoming_email_account)
+
+
+def send_project_update_copy(
+	project: Document, project_update: Document, recipient: str, reply_to: str | None
+):
+	# Not linked to the Project Update, so its name stays off the timeline
+	# (Frappe also matches In-Reply-To by Communication name).
+	communication = frappe.get_doc(
+		{
+			"doctype": "Communication",
+			"communication_type": "Communication",
+			"communication_medium": "Email",
+			"sent_or_received": "Sent",
+			"subject": project.subject,
+			"content": project.message,
+			"recipients": recipient,
+			"message_id": get_string_between("<", get_message_id(), ">"),
+		}
+	).insert(ignore_permissions=True)
+	frappe.db.delete("Communication Link", {"parent": communication.name})
+
 	frappe.sendmail(
-		recipients=get_users_email(doc),
-		message=doc.message,
-		subject=doc.subject,
+		recipients=[recipient],
+		message=project.message,
+		subject=project.subject,
 		reference_doctype=project_update.doctype,
 		reference_name=project_update.name,
-		reply_to=incoming_email_account,
+		reply_to=reply_to,
+		message_id=communication.message_id,
+		communication=communication.name,
 	)
 
 
@@ -865,7 +807,7 @@ def collect_project_status():
 def get_uncollected_replies(project_update):
 	collected = Counter((row.user, row.project_status) for row in project_update.users)
 	new_replies = []
-	for reply in get_project_update_replies(project_update.name):
+	for reply in get_project_update_replies(project_update):
 		key = (reply["user"], reply["project_status"])
 		if collected[key]:
 			collected[key] -= 1
@@ -874,25 +816,32 @@ def get_uncollected_replies(project_update):
 	return new_replies
 
 
-def get_project_update_replies(project_update):
+def get_project_update_replies(project_update: Document) -> list[dict]:
 	replies = frappe.get_all(
 		"Communication",
-		fields=["content", "text_content", "sender"],
+		fields=["in_reply_to", "sender", "content", "text_content"],
 		filters=dict(
 			reference_doctype="Project Update",
-			reference_name=project_update,
+			reference_name=project_update.name,
 			communication_type="Communication",
 			sent_or_received="Received",
 		),
 		order_by="creation asc",
 	)
+	sent_copies = get_sent_copies(project_update.name)
+	project_users = set(
+		frappe.get_all(
+			"Project User", filters={"parent": project_update.project, "parenttype": "Project"}, pluck="user"
+		)
+	)
 
 	users = []
 	for d in replies:
-		user_data = frappe.db.get_value(
-			"User", {"email": d.sender}, ["full_name", "user_image", "name"], as_dict=True
+		author = get_reply_author(d, sent_copies)
+		user_data = author and frappe.db.get_value(
+			"User", {"email": author}, ["full_name", "user_image", "name"], as_dict=True
 		)
-		if not user_data:
+		if not user_data or user_data.name not in project_users:
 			continue
 
 		users.append(
@@ -907,6 +856,41 @@ def get_project_update_replies(project_update):
 			}
 		)
 	return users
+
+
+def get_sent_copies(project_update: str) -> dict[str, str]:
+	"""Map each copy's Communication name to its recipient."""
+	copies = frappe.get_all(
+		"Email Queue",
+		filters={
+			"reference_doctype": "Project Update",
+			"reference_name": project_update,
+			"communication": ["is", "set"],
+		},
+		pluck="communication",
+	)
+	if not copies:
+		return {}
+	# Emails sent from the form are queued too, but they are linked; copies are not.
+	return dict(
+		frappe.get_all(
+			"Communication",
+			filters={"name": ["in", copies], "reference_doctype": ["is", "not set"]},
+			fields=["name", "recipients"],
+			as_list=True,
+		)
+	)
+
+
+def get_reply_author(reply: dict, sent_copies: dict) -> str | None:
+	"""Credit only a direct reply to a copy, from the address the copy was sent to."""
+	if not sent_copies:
+		return reply.sender  # update sent before per-user copies (upgrade day only)
+
+	recipient = sent_copies.get(reply.in_reply_to)
+	if recipient and recipient.lower() == (reply.sender or "").lower():
+		return recipient
+	return None
 
 
 def send_project_status_email_to_users():
@@ -965,6 +949,66 @@ def get_project_kanban_board(project: str) -> str | None:
 		filters = frappe.parse_json(board.filters or "[]")
 		if any(isinstance(f, list) and f[1:4] == ["project", "=", project] for f in filters):
 			return board.name
+
+
+@frappe.whitelist()
+def get_project_tasks(
+	project: str,
+	sort_by: str = "creation",
+	sort_order: str = "asc",
+	start: int = 0,
+	page_length: int = 50,
+	txt: str | None = None,
+) -> list[dict]:
+	"""One page of a project's tasks the user can read, for the Project form's Tasks tab.
+
+	`sort_by` can be any Task field the user may read. A Select field is ordered by its options (so
+	Priority runs Low to Urgent and Status follows the workflow) rather than alphabetically. Empty
+	values come last either way, and ties keep the order tasks were created in.
+	"""
+	if not frappe.has_permission("Project", "read", doc=project):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	sortable = set(frappe.model.get_permitted_fields("Task")) - set(frappe.model.optional_fields)
+	if sort_by not in sortable or sort_order not in ("asc", "desc"):
+		frappe.throw(_("Tasks cannot be sorted by {0} {1}").format(sort_by, sort_order))
+
+	Task = frappe.qb.DocType("Task")
+	df = frappe.get_meta("Task").get_field(sort_by)
+	sort_field = Task[sort_by]
+	is_empty = sort_field.isnull()
+	if df and df.fieldtype not in (*frappe.model.numeric_fieldtypes, *frappe.model.datetime_fields):
+		is_empty = is_empty | (sort_field == "")
+	if df and df.fieldtype == "Select" and df.options:
+		rank = Case()
+		for position, option in enumerate(df.options.split("\n")):
+			rank = rank.when(Task[sort_by] == option, position)
+		sort_field = rank
+
+	query = (
+		frappe.qb.get_query(
+			"Task",
+			fields=[
+				"name",
+				"subject",
+				"status",
+				"priority",
+				"_assign",
+				"exp_start_date",
+				"exp_end_date",
+				"progress",
+			],
+			filters={"project": project},
+			ignore_permissions=False,
+		)
+		.orderby(Case().when(is_empty, 1).else_(0))
+		.orderby(sort_field, order=Order.desc if sort_order == "desc" else Order.asc)
+		.orderby(Task.creation)
+		.limit(page_length)
+		.offset(start)
+	)
+	if txt:
+		query = query.where(Task.subject.like(f"%{txt}%") | Task.name.like(f"%{txt}%"))
+	return query.run(as_dict=True)
 
 
 @frappe.whitelist(methods=["POST"])

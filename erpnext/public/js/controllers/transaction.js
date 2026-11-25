@@ -339,12 +339,15 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		if (this.frm.fields_dict["items"].grid.get_field("blanket_order")) {
 			this.frm.set_query("blanket_order", "items", function (doc, cdt, cdn) {
 				var item = locals[cdt][cdn];
+				const is_selling = ["Sales Order", "Quotation"].includes(doc.doctype);
 				return {
 					query: "erpnext.controllers.queries.get_blanket_orders",
 					filters: {
 						company: doc.company,
 						currency: doc.currency,
-						blanket_order_type: doc.doctype === "Sales Order" ? "Selling" : "Purchasing",
+						blanket_order_type: is_selling ? "Selling" : "Purchasing",
+						party: is_selling ? doc.customer || doc.party_name : doc.supplier,
+						quotation_to: doc.quotation_to,
 						item: item.item_code,
 						transaction_date: doc.transaction_date,
 					},
@@ -713,6 +716,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			me.frm.doc.name
 		);
 
+		// a return keeps the taxes of the document it is made against
+		if (this.frm.doc.is_return && this.frm.doc.return_against) return;
+
 		if (!this.frm.doc.taxes_and_charges && this.frm.doc.taxes && this.frm.doc.taxes.length > 0) {
 			return;
 		}
@@ -875,6 +881,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 							child_doctype: item.doctype,
 							child_docname: item.name,
 							use_serial_batch_fields: item.use_serial_batch_fields,
+							against_blanket_order: item.against_blanket_order,
+							blanket_order: item.blanket_order,
 							serial_and_batch_bundle: item.serial_and_batch_bundle,
 						},
 					},
@@ -901,23 +909,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 								},
 								async () => {
 									// for internal customer instead of pricing rule directly apply valuation rate on item
-									if (me.frm.doc.is_internal_customer || me.frm.doc.is_internal_supplier) {
-										const fetch_valuation_rate_for_internal_transactions =
-											await frappe.db.get_single_value(
-												"Accounts Settings",
-												"fetch_valuation_rate_for_internal_transaction"
-											);
-										if (fetch_valuation_rate_for_internal_transactions) {
-											me.get_incoming_rate(
-												item,
-												me.frm.posting_date,
-												me.frm.posting_time,
-												me.frm.doc.doctype,
-												me.frm.doc.company
-											);
-											return;
-										}
-									}
+									if (await me.set_internal_valuation_rate(item)) return;
 									me.frm.script_manager.trigger("price_list_rate", cdt, cdn);
 								},
 								() => {
@@ -980,14 +972,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			},
 			() => {
 				// check if batch serial selector is disabled or not
-				if (show_batch_dialog && !frappe.flags.hide_serial_batch_dialog)
-					return frappe.db
-						.get_single_value("Stock Settings", "disable_serial_no_and_batch_selector")
-						.then((value) => {
-							if (value) {
-								frappe.flags.hide_serial_batch_dialog = true;
-							}
-						});
+				if (show_batch_dialog && frappe.boot.sysdefaults.disable_serial_no_and_batch_selector) {
+					frappe.flags.hide_serial_batch_dialog = true;
+				}
 			},
 			() => {
 				if (show_batch_dialog && !frappe.flags.hide_serial_batch_dialog && !frappe.flags.dialog_set) {
@@ -1040,6 +1027,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				precision("rate", item)
 			);
 
+		// the rate trigger does not run when the rate is unchanged
+		this.set_gross_profit(item);
 		this.calculate_taxes_and_totals();
 	}
 
@@ -1063,13 +1052,38 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		}
 	}
 
+	async set_internal_valuation_rate(item) {
+		if (!this.frm.doc.is_internal_customer && !this.frm.doc.is_internal_supplier) return false;
+
+		const fetch_valuation_rate = await frappe.db.get_single_value(
+			"Accounts Settings",
+			"fetch_valuation_rate_for_internal_transaction"
+		);
+		if (fetch_valuation_rate) {
+			this.get_incoming_rate(
+				item,
+				this.frm.doc.posting_date || this.frm.doc.transaction_date,
+				this.frm.doc.posting_time || this.frm.doc.transaction_time,
+				this.frm.doc.doctype,
+				this.frm.doc.company
+			);
+		}
+		return fetch_valuation_rate;
+	}
+
 	get_incoming_rate(item, posting_date, posting_time, voucher_type, company) {
+		const stock_qty = item.qty * item.conversion_factor;
+		// a delivery takes the stock out, so ask for its outgoing rate as the server does
+		const is_outgoing = this.frm.doc.is_internal_customer && !this.frm.doc.is_return;
+		// an internal purchase is valued at the sending warehouse, as handle_internal_parties does
+		const is_internal_purchase = ["Purchase Receipt", "Purchase Invoice"].includes(voucher_type);
+
 		let item_args = {
 			item_code: item.item_code,
-			warehouse: item.warehouse,
+			warehouse: is_internal_purchase ? item.from_warehouse : item.warehouse,
 			posting_date: posting_date,
 			posting_time: posting_time,
-			qty: item.qty * item.conversion_factor,
+			qty: is_outgoing ? -stock_qty : stock_qty,
 			serial_no: item.serial_no,
 			batch_no: item.batch_no,
 			voucher_type: voucher_type,
@@ -1077,12 +1091,21 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			allow_zero_valuation_rate: item.allow_zero_valuation_rate,
 		};
 
+		// only the newest request of a row sets its rate
+		this.incoming_rate_requests ??= {};
+		const request_id = (this.incoming_rate_requests[item.name] || 0) + 1;
+		this.incoming_rate_requests[item.name] = request_id;
+
 		frappe.call({
 			method: "erpnext.stock.utils.get_incoming_rate",
 			args: {
 				args: item_args,
 			},
-			callback: function (r) {
+			callback: (r) => {
+				if (this.incoming_rate_requests[item.name] !== request_id) return;
+				// the qty handler refetches an internal customer's rate, so skip the answer for an older qty
+				if (this.frm.doc.is_internal_customer && item.qty * item.conversion_factor !== stock_qty)
+					return;
 				frappe.model.set_value(item.doctype, item.name, "rate", r.message * item.conversion_factor);
 			},
 		});
@@ -1184,6 +1207,40 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 
 	update_stock() {
 		this.frm.trigger("set_default_internal_warehouse");
+	}
+
+	add_inter_company_order_button(label, target_doctype, reference_fieldname) {
+		if (!frappe.model.can_create(target_doctype)) return;
+
+		frappe.call({
+			method: "erpnext.accounts.doctype.sales_invoice.mapper.get_received_items",
+			args: {
+				reference_name: this.frm.doc.name,
+				doctype: target_doctype,
+				reference_fieldname: reference_fieldname,
+			},
+			callback: (r) => {
+				const received_items = r.message;
+				// An order made from its counterpart links it without item references.
+				const is_made_from_counterpart =
+					this.frm.doc.inter_company_order_reference && $.isEmptyObject(received_items);
+				const has_pending_qty = this.frm.doc.items.some(
+					(item) =>
+						!item.closed &&
+						flt(
+							(item.stock_qty - flt(received_items[item.name])) / item.conversion_factor,
+							precision("qty", item)
+						) > 0
+				);
+				if (is_made_from_counterpart || !has_pending_qty) return;
+
+				this.frm.add_custom_button(
+					label,
+					() => this.make_inter_company_order(this.frm),
+					__("Create")
+				);
+			},
+		});
 	}
 
 	set_default_internal_warehouse() {
@@ -1369,7 +1426,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 	transaction_date() {
 		if (this.frm.doc.transaction_date) {
 			this.frm.transaction_date = this.frm.doc.transaction_date;
-			frappe.ui.form.trigger(this.frm.doc.doctype, "currency");
+			this.update_rates_for_new_date();
 			this.recalculate_terms();
 		}
 	}
@@ -1397,14 +1454,24 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 						if (r.message) {
 							me.frm.doc.due_date = r.message;
 							refresh_field("due_date");
-							frappe.ui.form.trigger(me.frm.doc.doctype, "currency");
+							me.update_rates_for_new_date();
 							me.recalculate_terms();
 						}
 					},
 				});
 			} else {
-				frappe.ui.form.trigger(me.frm.doc.doctype, "currency");
+				me.update_rates_for_new_date();
 			}
+		}
+	}
+
+	async update_rates_for_new_date() {
+		const previous_rate = flt(this.frm.doc.conversion_rate);
+		await this.frm.script_manager.trigger("currency");
+
+		// A changed rate re-prices via the conversion_rate trigger; an unchanged one fires nothing
+		if (flt(this.frm.doc.conversion_rate) === previous_rate) {
+			this.apply_pricing_rule();
 		}
 	}
 
@@ -1517,13 +1584,14 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		// before this trigger updates the tracker for the next one.
 		let previous_currency = this._doc_currency;
 		this._doc_currency = this.frm.doc.currency;
-		// Added `load_after_mapping` to determine if document is loading after mapping from another doc
+		// A mapped document keeps its source's rate, unless its currency is changed
 		if (
 			this.frm.doc.currency &&
 			this.frm.doc.currency !== company_currency &&
 			(!this.frm.doc.__onload?.load_after_mapping ||
 				inter_company_reference ||
-				this.frm.doc.use_transaction_date_exchange_rate)
+				this.frm.doc.use_transaction_date_exchange_rate ||
+				previous_currency !== this.frm.doc.currency)
 		) {
 			this.get_exchange_rate(
 				transaction_date,
@@ -1559,10 +1627,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		if (this.frm.doc.currency === this.get_company_currency()) {
 			this.frm.set_value("conversion_rate", 1.0);
 		}
-		if (
-			this.frm.doc.currency === this.frm.doc.price_list_currency &&
-			this.frm.doc.plc_conversion_rate !== this.frm.doc.conversion_rate
-		) {
+		const plc_follows_currency = this.frm.doc.currency === this.frm.doc.price_list_currency;
+		if (plc_follows_currency && this.frm.doc.plc_conversion_rate !== this.frm.doc.conversion_rate) {
 			this.frm.set_value("plc_conversion_rate", this.frm.doc.conversion_rate);
 		}
 
@@ -1570,7 +1636,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			if (this.frm.doc.__onload?.load_after_mapping) {
 				this.calculate_taxes_and_totals();
 			} else if (!this.in_apply_price_list) {
-				this.apply_price_list();
+				// keep the price list exchange rate just synced above, else the server refetches the market rate
+				this.apply_price_list(null, plc_follows_currency);
 			}
 		}
 		// Make read only if Accounts Settings doesn't allow stale rates
@@ -1599,7 +1666,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 					doc: this.frm.doc,
 					method: "apply_shipping_rule",
 					callback: function (r) {
-						me._calculate_taxes_and_totals();
+						me.calculate_discounted_totals();
 					},
 				})
 				.fail(() => this.frm.set_value("shipping_rule", ""));
@@ -1723,7 +1790,6 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 	uom(doc, cdt, cdn) {
 		var me = this;
 		var item = frappe.get_doc(cdt, cdn);
-		item.pricing_rules = "";
 		if (item.item_code && item.uom) {
 			return this.frm.call({
 				method: "erpnext.stock.get_item_details.get_conversion_factor",
@@ -1734,7 +1800,11 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				callback: function (r) {
 					if (!r.exc) {
 						frappe.model.set_value(cdt, cdn, "conversion_factor", r.message.conversion_factor);
-						me.apply_price_list(item, true);
+						frappe.run_serially([
+							() => me.apply_price_list(item, true),
+							// the price list response sets the rate, so set an internal rate after it
+							() => me.set_internal_valuation_rate(item),
+						]);
 					}
 				},
 			});
@@ -1761,8 +1831,14 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				return;
 			}
 
-			if (!dont_fetch_price_list_rate && frappe.meta.has_field(doc.doctype, "price_list_currency")) {
-				this.apply_price_list(item, true);
+			if (!dont_fetch_price_list_rate) {
+				frappe.run_serially([
+					() =>
+						frappe.meta.has_field(doc.doctype, "price_list_currency") &&
+						this.apply_price_list(item, true),
+					// an internal rate is per stock UOM, so it changes with the conversion factor
+					() => this.set_internal_valuation_rate(item),
+				]);
 			}
 			this.calculate_stock_uom_rate(doc, cdt, cdn);
 		}
@@ -1817,6 +1893,8 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				() => this.apply_price_list(item, true), //reapply price list before applying pricing rule
 				() => this.calculate_stock_uom_rate(doc, cdt, cdn),
 				() => this.apply_pricing_rule(item, true),
+				// the outgoing rate of an internal delivery depends on the qty
+				() => this.frm.doc.is_internal_customer && this.set_internal_valuation_rate(item),
 			]);
 		} else {
 			this.conversion_factor(doc, cdt, cdn, true);
@@ -2075,7 +2153,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		});
 
 		let show =
-			cint(this.frm.doc.discount_amount) ||
+			flt(this.frm.doc.discount_amount) ||
 			(this.frm.doc.taxes || []).filter(function (d) {
 				return d.included_in_print_rate === 1;
 			}).length;
@@ -2175,7 +2253,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		var me = this;
 
 		var show =
-			cint(this.frm.doc.discount_amount) ||
+			flt(this.frm.doc.discount_amount) ||
 			(this.frm.doc.taxes || []).filter(function (d) {
 				return d.included_in_print_rate === 1;
 			}).length;
@@ -2871,9 +2949,15 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 	}
 
 	set_gross_profit(item) {
-		if (["Sales Order", "Quotation"].includes(this.frm.doc.doctype) && item.valuation_rate) {
-			var rate = flt(item.rate) * flt(this.frm.doc.conversion_rate || 1);
-			item.gross_profit = flt((rate - item.valuation_rate) * item.stock_qty, precision("amount", item));
+		if (["Sales Order", "Quotation"].includes(this.frm.doc.doctype)) {
+			// valuation rate is per stock UOM, so compare it with the company currency rate per stock UOM
+			const rate =
+				(flt(item.rate) * flt(this.frm.doc.conversion_rate || 1)) /
+				(flt(item.conversion_factor) || 1);
+			item.gross_profit = flt(
+				(rate - flt(item.valuation_rate)) * flt(item.stock_qty),
+				precision("gross_profit", item)
+			);
 		}
 	}
 
@@ -3244,6 +3328,14 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 					}
 				},
 			});
+		} else if (
+			!doc.payment_terms_template &&
+			this.frm.updating_party_details &&
+			doc.payment_schedule?.length
+		) {
+			// the new party has no terms, so drop the previous party's schedule
+			this.frm.clear_table("payment_schedule");
+			this.frm.refresh_field("payment_schedule");
 		}
 	}
 
@@ -3384,7 +3476,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 
 	setup_accounting_dimension_triggers() {
 		frappe.call({
-			method: "erpnext.accounts.doctype.accounting_dimension.accounting_dimension.get_dimensions",
+			method: "erpnext.accounts.doctype.accounting_dimension.accounting_dimension.get_dimensions_for_user",
 			callback: (r) => {
 				if (r.message && r.message[0]) {
 					let dimensions = r.message[0].map((d) => d.fieldname);
@@ -3456,7 +3548,7 @@ erpnext.show_serial_batch_selector = function (frm, item_row, callback, on_close
 		if (r) {
 			let update_values = {
 				serial_and_batch_bundle: r.name,
-				qty: Math.abs(r.total_qty),
+				qty: erpnext.stock.get_sbie_row_qty(frm.doc, item_row, "qty", Math.abs(r.total_qty)),
 			};
 
 			if (r.warehouse) {

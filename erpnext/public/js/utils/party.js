@@ -6,6 +6,11 @@ frappe.provide("erpnext.utils");
 const SALES_DOCTYPES = ["Quotation", "Sales Order", "Delivery Note", "Sales Invoice"];
 const PURCHASE_DOCTYPES = ["Supplier Quotation", "Purchase Order", "Purchase Receipt", "Purchase Invoice"];
 
+erpnext.utils.get_party_account_currency = function (party, company) {
+	// the server allows only accounts in the billing currency, or in the company currency without one
+	return party.default_currency || erpnext.get_currency(company);
+};
+
 erpnext.utils.get_party_details = function (frm, method, args, callback) {
 	if (!method) {
 		method = "erpnext.accounts.party.get_party_details";
@@ -289,8 +294,7 @@ erpnext.utils.set_taxes = function (frm, triggered_from_field) {
 			customer_group: frm.doc.customer_group,
 			supplier_group: frm.doc.supplier_group,
 			tax_category: frm.doc.tax_category,
-			billing_address:
-				frm.doc.customer || frm.doc.lead ? frm.doc.customer_address : frm.doc.supplier_address,
+			billing_address: party_type === "Supplier" ? frm.doc.supplier_address : frm.doc.customer_address,
 			shipping_address: frm.doc.shipping_address_name,
 		},
 		callback: function (r) {

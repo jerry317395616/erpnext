@@ -9,6 +9,8 @@ from frappe.query_builder import Criterion
 from frappe.query_builder.functions import IfNull
 from pypika.terms import Bracket, LiteralValue
 
+from erpnext.accounts.report.utils import validate_date_range
+
 
 class PaymentLedger:
 	def __init__(self, filters=None):
@@ -155,7 +157,9 @@ class PaymentLedger:
 		self.build_conditions()
 
 		# fetch data from table
-		query = qb.from_(ple).select(ple.star).where(ple.delinked == 0).where(Criterion.all(self.conditions))
+		query = qb.from_(ple).select(ple.star).where(Criterion.all(self.conditions))
+		if not self.filters.show_cancelled_entries:
+			query = query.where(ple.delinked == 0)
 
 		from frappe.desk.reportview import build_match_conditions
 
@@ -272,4 +276,6 @@ class PaymentLedger:
 
 
 def execute(filters=None):
+	validate_date_range(filters, "period_start_date", "period_end_date")
+
 	return PaymentLedger(filters).run()

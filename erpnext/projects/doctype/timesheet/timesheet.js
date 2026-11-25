@@ -44,6 +44,10 @@ frappe.ui.form.on("Timesheet", {
 		if (frm.is_new() && !frm.doc.employee) {
 			set_employee_and_company(frm);
 		}
+
+		if (frm.is_new() && !flt(frm.doc.exchange_rate)) {
+			set_exchange_rate(frm);
+		}
 	},
 
 	refresh: function (frm) {
@@ -58,37 +62,44 @@ frappe.ui.form.on("Timesheet", {
 		if (frm.doc.docstatus < 1) {
 			let button = __("Start Timer");
 			$.each(frm.doc.time_logs || [], function (i, row) {
-				if (row.from_time <= frappe.datetime.now_datetime() && !row.completed) {
+				if (row.from_time <= frappe.datetime.system_datetime() && !row.completed) {
 					button = __("Resume Timer");
 				}
 			});
 
-			frm.add_custom_button(__(button), function () {
-				var flag = true;
-				$.each(frm.doc.time_logs || [], function (i, row) {
-					// Fetch the row for which from_time is not present
-					if (flag && row.activity_type && !row.from_time) {
-						erpnext.timesheet.timer(frm, row);
-						row.from_time = frappe.datetime.now_datetime();
-						frm.refresh_fields("time_logs");
-						frm.save();
-						flag = false;
+			frm.add_custom_button(
+				__(button),
+				function () {
+					var flag = true;
+					$.each(frm.doc.time_logs || [], function (i, row) {
+						// Fetch the row for which from_time is not present
+						if (flag && row.activity_type && !row.from_time) {
+							erpnext.timesheet.timer(frm, row);
+							row.from_time = frappe.datetime.get_datetime_as_string(
+								frappe.datetime.system_datetime()
+							);
+							frm.refresh_fields("time_logs");
+							frm.save();
+							flag = false;
+						}
+						// Fetch the row for timer where activity is not completed and from_time is before now_time
+						if (flag && row.from_time <= frappe.datetime.system_datetime() && !row.completed) {
+							let timestamp = moment(frappe.datetime.system_datetime()).diff(
+								moment(row.from_time),
+								"seconds"
+							);
+							erpnext.timesheet.timer(frm, row, timestamp);
+							flag = false;
+						}
+					});
+					// If no activities found to start a timer, create new
+					if (flag) {
+						erpnext.timesheet.timer(frm);
 					}
-					// Fetch the row for timer where activity is not completed and from_time is before now_time
-					if (flag && row.from_time <= frappe.datetime.now_datetime() && !row.completed) {
-						let timestamp = moment(frappe.datetime.now_datetime()).diff(
-							moment(row.from_time),
-							"seconds"
-						);
-						erpnext.timesheet.timer(frm, row, timestamp);
-						flag = false;
-					}
-				});
-				// If no activities found to start a timer, create new
-				if (flag) {
-					erpnext.timesheet.timer(frm);
-				}
-			}).addClass("btn-primary");
+				},
+				null,
+				"primary"
+			);
 		}
 
 		let filters = {
@@ -122,27 +133,12 @@ frappe.ui.form.on("Timesheet", {
 		frm.refresh();
 	},
 
+	company: function (frm) {
+		frm.trigger("currency");
+	},
+
 	currency: function (frm) {
-		let base_currency = frappe.defaults.get_global_default("currency");
-		if (frm.doc.currency && base_currency != frm.doc.currency) {
-			frappe.call({
-				method: "erpnext.setup.utils.get_exchange_rate",
-				args: {
-					from_currency: frm.doc.currency,
-					to_currency: base_currency,
-				},
-				callback: function (r) {
-					if (r.message) {
-						frm.set_value("exchange_rate", flt(r.message));
-						frm.set_df_property(
-							"exchange_rate",
-							"description",
-							"1 " + frm.doc.currency + " = [?] " + base_currency
-						);
-					}
-				},
-			});
-		}
+		set_exchange_rate(frm);
 		frm.trigger("set_dynamic_field_label");
 	},
 
@@ -371,7 +367,12 @@ var calculate_end_time = function (frm, cdt, cdn) {
 
 	if (!child.from_time) {
 		// if from_time value is not available then set the current datetime
-		frappe.model.set_value(cdt, cdn, "from_time", frappe.datetime.get_datetime_as_string());
+		frappe.model.set_value(
+			cdt,
+			cdn,
+			"from_time",
+			frappe.datetime.get_datetime_as_string(frappe.datetime.system_datetime())
+		);
 	}
 
 	let d = moment(child.from_time);
@@ -441,6 +442,38 @@ var calculate_time_and_amount = function (frm) {
 	frm.set_value("total_hours", total_working_hr);
 	frm.set_value("total_billable_amount", total_billable_amount);
 	frm.set_value("total_costing_amount", total_costing_amount);
+};
+
+var set_exchange_rate = function (frm) {
+	let company_currency = erpnext.get_currency(frm.doc.company);
+	// a later call makes this quote stale, so its response is dropped
+	let quote = [frm.doc.currency, company_currency].join("|");
+	frm.exchange_rate_quote = quote;
+
+	if (!frm.doc.currency || frm.doc.currency == company_currency) {
+		frm.set_value("exchange_rate", 1);
+		return;
+	}
+
+	// clear the old quote, so that a failed lookup does not keep it
+	frm.set_value("exchange_rate", 0);
+	frappe.call({
+		method: "erpnext.setup.utils.get_exchange_rate",
+		args: {
+			from_currency: frm.doc.currency,
+			to_currency: company_currency,
+		},
+		callback: function (r) {
+			if (frm.exchange_rate_quote !== quote || !r.message) return;
+
+			frm.set_value("exchange_rate", flt(r.message));
+			frm.set_df_property(
+				"exchange_rate",
+				"description",
+				"1 " + frm.doc.currency + " = [?] " + company_currency
+			);
+		},
+	});
 };
 
 // set employee (and company) to the one that's currently logged in

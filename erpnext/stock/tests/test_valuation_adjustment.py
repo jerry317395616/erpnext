@@ -48,7 +48,11 @@ from erpnext.stock.report.stock_valuation_comparison.stock_valuation_comparison 
 from erpnext.stock.report.stock_valuation_comparison.test_stock_valuation_comparison import (
 	make_batch_without_batch_wise_valuation,
 )
-from erpnext.stock.valuation_adjustment import ADJUSTMENT_ENTRY, BackdatedEntryBeforeAdjustmentError
+from erpnext.stock.valuation_adjustment import (
+	ADJUSTMENT_ENTRY,
+	BackdatedEntryBeforeAdjustmentError,
+	ManualAdjustmentEntryError,
+)
 from erpnext.tests.utils import ERPNextTestSuite
 
 COMPANY = "_Test Company"
@@ -142,6 +146,7 @@ class ValuationFixTestCase(ERPNextTestSuite):
 		self.assertEqual(result["not_adjusted"], [])
 		adjustment = frappe.get_doc("Stock Reconciliation", result["adjustment_entry"])
 		self.assertEqual(adjustment.purpose, ADJUSTMENT_ENTRY)
+		self.assertTrue(adjustment.is_made_from_valuation_comparison)
 		adjustment.submit()
 
 		# from its date on the ledger is right
@@ -365,14 +370,14 @@ class ValuationFixTestCase(ERPNextTestSuite):
 
 		return item
 
-	def make_standard_cost_item(self, **properties) -> str:
+	def make_standard_cost_item(self, rate=100, **properties) -> str:
 		from erpnext.stock.doctype.item_standard_cost.test_item_standard_cost import (
 			create_item_standard_cost,
 			create_standard_cost_item,
 		)
 
 		item = create_standard_cost_item(**properties).name
-		create_item_standard_cost(item, rate=100, company=COMPANY, effective_date=last_year(70))
+		create_item_standard_cost(item, rate=rate, company=COMPANY, effective_date=last_year(70))
 		return item
 
 	def make_standard_cost_balance_qty_wrong(self) -> str:
@@ -526,6 +531,53 @@ class TestFixingWrongLedgers(ValuationFixTestCase):
 			sorted((row.qty, row.valuation_rate) for row in adjustment.items), [(1, 100), (2, 200)]
 		)
 		self.assertEqual(adjustment.difference_amount, 50)
+
+	def test_serial_nos_counted_in_at_their_unrounded_rate(self):
+		item = self.make_serial_item("SVA-SRR-.#####")
+		receipt = make_stock_entry(
+			item_code=item, target=WAREHOUSE, qty=50, rate=33.3333, posting_date=last_year(60)
+		)
+		serial_no = frappe.db.get_value(
+			"Serial and Batch Entry", {"parent": receipt.items[0].serial_and_batch_bundle}, "serial_no"
+		)
+		issue = make_stock_entry(
+			item_code=item, source=WAREHOUSE, qty=1, serial_no=[serial_no], posting_date=last_year(50)
+		)
+		self.corrupt_entry(issue.name, bundle_value=-50, stock_value_difference=-50, stock_value=1616.66)
+
+		adjustment = self.fix_by_adjustment_entry(item)
+
+		self.assertEqual([(row.qty, row.valuation_rate) for row in adjustment.items], [(49, 33.3333)])
+		self.assertEqual(adjustment.items[0].amount, 1633.33)
+
+	def test_layers_at_fractional_rates_fixed_by_adjustment_entry(self):
+		item = make_item(properties={"is_stock_item": 1, "valuation_method": "FIFO"}).name
+		for days, rate in ((60, 1.004), (59, 2.004), (58, 3.004)):
+			make_stock_entry(item_code=item, target=WAREHOUSE, qty=1, rate=rate, posting_date=last_year(days))
+		receipt = make_stock_entry(
+			item_code=item, target=WAREHOUSE, qty=1, rate=10, posting_date=last_year(50)
+		)
+		self.corrupt_entry(receipt.name, stock_value_difference=15, stock_value=21)
+
+		# the ledger rounds the value after every counted-in row: 16, not 16.01
+		self.fix_by_adjustment_entry(item)
+
+	def test_standard_cost_batches_fixed_by_adjustment_entry(self):
+		from erpnext.stock.doctype.item_standard_cost.test_item_standard_cost import ensure_ppv_account
+
+		ensure_ppv_account(COMPANY)
+		item = self.make_standard_cost_item(
+			rate=1.001, has_batch_no=1, create_new_batch=1, batch_number_series="SVA-SCB-.#####"
+		)
+		for days in range(60, 50, -1):
+			make_stock_entry(
+				item_code=item, target=WAREHOUSE, qty=3, basic_rate=1.001, posting_date=last_year(days)
+			)
+		issue = make_stock_entry(item_code=item, source=WAREHOUSE, qty=1, posting_date=last_year(50))
+		self.corrupt_entry(issue.name, stock_value_difference=-6, stock_value=24.03)
+
+		# a row per batch, but the ledger values the whole balance at the standard rate: 29.03, not 29
+		self.fix_by_adjustment_entry(item)
 
 	def test_serial_no_counted_twice_fixed_by_adjustment_entry(self):
 		# a repost cannot take out an entry that should not be there; an adjustment can
@@ -711,6 +763,42 @@ class TestAdjustmentEntry(ValuationFixTestCase):
 		adjustment.items[0].valuation_rate = 90
 		self.assertRaises(frappe.ValidationError, adjustment.save)
 
+	def test_rows_are_checked_on_the_posting_date_set_on_save(self):
+		item = self.make_fifo_issue_at_wrong_value()
+		result = make_adjustment_entry(COMPANY, self.get_differences(item), get_adjustment_date(), "00:00:00")
+
+		adjustment = frappe.get_doc("Stock Reconciliation", result["adjustment_entry"])
+		adjustment.set_posting_time = 0
+		self.assertRaises(frappe.ValidationError, adjustment.save)
+
+	def test_adjustment_entry_cannot_be_selected_manually(self):
+		item = make_item(properties={"is_stock_item": 1, "valuation_method": "FIFO"}).name
+		make_stock_entry(item_code=item, target=WAREHOUSE, qty=10, rate=100)
+		reconciliation = frappe.get_doc(
+			{
+				"doctype": "Stock Reconciliation",
+				"company": COMPANY,
+				"purpose": ADJUSTMENT_ENTRY,
+				"items": [{"item_code": item, "warehouse": WAREHOUSE, "qty": 10, "valuation_rate": 100}],
+			}
+		)
+		self.assertRaises(ManualAdjustmentEntryError, reconciliation.insert)
+
+		reconciliation.purpose = "Stock Reconciliation"
+		reconciliation.items[0].qty = 12
+		reconciliation.insert()
+		reconciliation.purpose = ADJUSTMENT_ENTRY
+		self.assertRaises(ManualAdjustmentEntryError, reconciliation.save)
+
+	def test_duplicate_of_adjustment_entry_is_not_allowed(self):
+		item = self.make_fifo_issue_at_wrong_value()
+		result = make_adjustment_entry(COMPANY, self.get_differences(item), get_adjustment_date(), "00:00:00")
+
+		copy = frappe.copy_doc(
+			frappe.get_doc("Stock Reconciliation", result["adjustment_entry"]), ignore_no_copy=False
+		)
+		self.assertRaises(ManualAdjustmentEntryError, copy.insert)
+
 	def test_no_backdated_entry_before_an_adjustment_entry(self):
 		item = self.make_fifo_issue_at_wrong_value()
 		issue = frappe.get_last_doc("Stock Entry", filters={"posting_date": last_year(50)})
@@ -735,6 +823,21 @@ class TestAdjustmentEntry(ValuationFixTestCase):
 		adjustment.reload()
 		adjustment.cancel()
 		make_stock_entry(item_code=item, target=WAREHOUSE, qty=1, rate=100, posting_date=last_year(10))
+
+	def test_entry_at_the_adjustment_time_made_before_it_cannot_be_cancelled(self):
+		item = self.make_fifo_issue_at_wrong_value()
+		issue = make_stock_entry(
+			item_code=item,
+			source=WAREHOUSE,
+			qty=2,
+			posting_date=get_adjustment_date(),
+			posting_time="00:00:00",
+		)
+		result = make_adjustment_entry(COMPANY, self.get_differences(item), get_adjustment_date(), "00:00:00")
+		frappe.get_doc("Stock Reconciliation", result["adjustment_entry"]).submit()
+
+		issue.reload()
+		self.assertRaises(BackdatedEntryBeforeAdjustmentError, issue.cancel)
 
 	def test_no_backdated_entry_of_an_adjusted_batch(self):
 		item = self.make_batch_issued_at_wrong_value()

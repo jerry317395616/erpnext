@@ -267,6 +267,7 @@ class TaxWithholdingEntry(Document):
 		}
 
 		if self.is_taxable_different:
+			self._validate_no_return_reversed_tax()
 			frappe.db.set_value(
 				DOCTYPE,
 				filters,
@@ -296,6 +297,51 @@ class TaxWithholdingEntry(Document):
 						"status": "Over Withheld",
 					},
 				)
+
+	def _validate_no_return_reversed_tax(self):
+		"""
+		A return against the taxable document reverses the tax this document withheld for it.
+		Cancelling would leave that reversal with no tax to reverse.
+		"""
+		if not self.withholding_amount or not frappe.get_meta(self.taxable_doctype).has_field(
+			"return_against"
+		):
+			return
+
+		returns = frappe.get_all(
+			self.taxable_doctype,
+			filters={"return_against": self.taxable_name, "is_return": 1, "docstatus": 1},
+			pluck="name",
+		)
+		if not returns:
+			return
+
+		reversed_in = frappe.get_all(
+			DOCTYPE,
+			filters={
+				"parenttype": self.taxable_doctype,
+				"parent": ["in", returns],
+				"tax_withholding_category": self.tax_withholding_category,
+				"withholding_amount": ["!=", 0],
+				"docstatus": 1,
+			},
+			pluck="parent",
+			distinct=True,
+		)
+		if not reversed_in:
+			return
+
+		frappe.throw(
+			_(
+				"Cannot cancel {0} {1} because it withheld tax for {2} {3}, and the return {4} reversed that tax. Cancel the return first."
+			).format(
+				_(self.withholding_doctype),
+				frappe.bold(self.withholding_name),
+				_(self.taxable_doctype),
+				frappe.bold(self.taxable_name),
+				", ".join(frappe.bold(name) for name in reversed_in),
+			)
+		)
 
 	def _handle_return_invoice_cancellation(self, filters):
 		# Get old entries that need adjustment - inspired by _adjust_against_old_entries
@@ -1366,30 +1412,39 @@ class JournalTaxWithholding(TaxWithholdingController):
 
 	def update_tax_rows(self):
 		if not self._should_apply_tds():
-			self._cleanup_duplicate_tds_rows(None)
+			self._remove_tds_rows()
 			return
 
 		if self.has_multiple_parties:
 			frappe.throw(_("Cannot apply TDS against multiple parties in one entry"))
 
-		account_amount_map = self._calculate_account_wise_amount()
-
-		if not account_amount_map:
-			return
-
 		self._reset_existing_tds()
 
-		for account_head, tax_amount in account_amount_map.items():
+		tax_row = None
+		for account_head, tax_amount in self._calculate_account_wise_amount().items():
 			if not tax_amount:
 				continue
 
-			self._create_or_update_tds_row(account_head, tax_amount)
+			tax_row = self._create_or_update_tds_row(account_head, tax_amount)
 			self._update_party_amount(tax_amount, is_reversal=False)
+
+		# no tax is due now, so the row of an earlier save must go
+		if not tax_row:
+			self._cleanup_duplicate_tds_rows(None)
 
 		self._recalculate_totals()
 
 	def _should_apply_tds(self):
 		return self.doc.apply_tds and self.doc.voucher_type in ("Debit Note", "Credit Note")
+
+	def _remove_tds_rows(self):
+		"""Give the TDS of an earlier save back to the party and remove its row"""
+		if not (self.existing_tds_rows and self.party_row):
+			return
+
+		self._reset_existing_tds()
+		self._cleanup_duplicate_tds_rows(None)
+		self._recalculate_totals()
 
 	def _reset_existing_tds(self):
 		for row in self.existing_tds_rows:
@@ -1491,6 +1546,7 @@ class JournalTaxWithholding(TaxWithholdingController):
 		)
 
 		self._cleanup_duplicate_tds_rows(tax_row)
+		return tax_row
 
 	def _cleanup_duplicate_tds_rows(self, current_tax_row):
 		rows_to_remove = [
@@ -1508,15 +1564,12 @@ class JournalTaxWithholding(TaxWithholdingController):
 		self.doc.set_against_account()
 
 	def _is_tax_withholding_applicable(self):
-		if not self._should_apply_tds():
-			self.doc.tax_withholding_entries = []
-			return False
+		if self._should_apply_tds() and self.doc.tax_withholding_category:
+			return True
 
-		if not self.doc.tax_withholding_category:
-			self.doc.tax_withholding_entries = []
-			return False
-
-		return True
+		self.doc.tax_withholding_entries = []
+		self._remove_tds_rows()
+		return False
 
 	def _get_linked_payments(self):
 		"""Journal Entry doesn't have advances like invoices"""

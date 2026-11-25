@@ -8,7 +8,7 @@ from frappe.model.document import Document
 from frappe.query_builder.functions import Sum
 from frappe.utils import cint, flt
 
-from erpnext.manufacturing.doctype.bom.bom import validate_bom_no
+from erpnext.manufacturing.doctype.bom.bom import validate_production_bom
 
 # Backward-compatible re-exports (moved to mapper.py / services/).
 from erpnext.manufacturing.doctype.production_plan.mapper import (
@@ -18,7 +18,6 @@ from erpnext.manufacturing.doctype.production_plan.mapper import (
 from erpnext.manufacturing.doctype.production_plan.services.material_request import (
 	MaterialRequestService,
 	download_raw_materials,
-	get_bin_details,
 	get_exploded_items,
 	get_item_data,
 	get_items_for_material_requests,
@@ -31,7 +30,13 @@ from erpnext.manufacturing.doctype.production_plan.services.material_request imp
 	get_warehouse_list,
 	set_default_warehouses,
 )
+from erpnext.manufacturing.doctype.production_plan.services.planning_queries import (
+	get_bin_details,
+	get_plan_process_loss_percentage,
+	get_reserved_qty_from_stock,
+)
 from erpnext.manufacturing.doctype.production_plan.services.reservation import (
+	ProductionPlanStockReservation,
 	cancel_stock_reservation_entries,
 	get_reserved_qty_for_production_plan,
 	get_reserved_qty_for_sub_assembly,
@@ -49,6 +54,9 @@ from erpnext.manufacturing.doctype.production_plan.services.work_order_planning 
 )
 from erpnext.manufacturing.doctype.production_plan.services.work_order_quantities import (
 	ProductionPlanWorkOrderQuantities,
+)
+from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	clear_reserve_stock_if_disabled,
 )
 from erpnext.stock.utils import get_or_make_bin, validate_warehouse_company
 from erpnext.utilities.transaction_base import validate_uom_is_integer
@@ -88,6 +96,7 @@ class ProductionPlan(Document):
 		combine_sub_items: DF.Check
 		company: DF.Link
 		consider_minimum_order_qty: DF.Check
+		consider_process_loss: DF.Check
 		customer: DF.Link | None
 		for_warehouse: DF.Link | None
 		from_date: DF.Date | None
@@ -148,6 +157,7 @@ class ProductionPlan(Document):
 
 	def validate(self):
 		self.set_pending_qty_in_row_without_reference()
+		self.set_process_loss_percentage()
 		self.calculate_total_planned_qty()
 		self.set_status()
 		self._rename_temporary_references()
@@ -156,8 +166,8 @@ class ProductionPlan(Document):
 		self.validate_sales_orders()
 		self.validate_material_request_type()
 		self.validate_raw_material_group_warehouse()
-		if self.for_warehouse:
-			validate_warehouse_company(self.for_warehouse, self.company)
+		self.validate_warehouse_belongs_to_company()
+		clear_reserve_stock_if_disabled(self)
 		self.enable_auto_reserve_stock()
 
 	def on_update(self):
@@ -177,6 +187,17 @@ class ProductionPlan(Document):
 				_("The items of the plan changed, so its schedule was cleared. Use Schedule Items again."),
 				alert=True,
 			)
+
+	def validate_warehouse_belongs_to_company(self):
+		warehouses = {self.for_warehouse, self.sub_assembly_warehouse}
+		warehouses.update(row.warehouse for row in self.po_items)
+		warehouses.update(row.fg_warehouse for row in self.sub_assembly_items)
+		for row in self.mr_items:
+			warehouses.update((row.warehouse, row.from_warehouse))
+
+		for warehouse in warehouses:
+			if warehouse:
+				validate_warehouse_company(warehouse, self.company)
 
 	def validate_raw_material_group_warehouse(self):
 		if not self.raw_material_group_warehouse:
@@ -252,13 +273,16 @@ class ProductionPlan(Document):
 			if not item.get("sales_order") or not item.get("material_request"):
 				item.pending_qty = item.planned_qty
 
+	def set_process_loss_percentage(self):
+		for item in self.po_items:
+			item.process_loss_percentage = get_plan_process_loss_percentage(self, item.bom_no)
+
 	def calculate_total_planned_qty(self):
 		self.total_planned_qty = 0
 		for d in self.po_items:
 			self.total_planned_qty += flt(d.planned_qty)
 
 	def validate_data(self):
-		validated_boms = set()
 		templates = frappe.get_all(
 			"Item",
 			filters={"name": ("in", [d.item_code for d in self.po_items]), "has_variants": 1},
@@ -274,9 +298,6 @@ class ProductionPlan(Document):
 
 			if not d.bom_no:
 				frappe.throw(_("Please select BOM for Item in Row {0}").format(d.idx))
-			elif (d.item_code, d.bom_no) not in validated_boms:
-				validate_bom_no(d.item_code, d.bom_no)
-				validated_boms.add((d.item_code, d.bom_no))
 
 			if not flt(d.planned_qty):
 				frappe.throw(
@@ -284,6 +305,15 @@ class ProductionPlan(Document):
 						d.idx, frappe.bold(d.item_code)
 					)
 				)
+
+		self.validate_boms()
+
+	def validate_boms(self):
+		"""Each BOM must produce the item of its row."""
+		boms = dict.fromkeys((d.item_code, d.bom_no) for d in self.po_items)
+		boms.update(dict.fromkeys((d.production_item, d.bom_no) for d in self.sub_assembly_items if d.bom_no))
+		for item_code, bom_no in boms:
+			validate_production_bom(item_code, bom_no)
 
 	def _rename_temporary_references(self):
 		"""po_items and sub_assembly_items items are both constructed client side without saving.
@@ -322,7 +352,46 @@ class ProductionPlan(Document):
 			self.update_bin_qty()
 
 	def before_submit(self):
+		self.validate_closed_sales_order_items()
 		self.validate_sales_order_planned_qty()
+
+	def validate_closed_sales_order_items(self):
+		so_items = {row.sales_order_item for row in self.po_items if row.sales_order_item}
+		precision = self.precision("qty", "prod_plan_references")
+		so_items.update(
+			row.sales_order_item for row in self.get_allocated_references() if flt(row.qty, precision)
+		)
+		if not so_items:
+			return
+
+		so_item = frappe.qb.DocType("Sales Order Item")
+		so = frappe.qb.DocType("Sales Order")
+		closed = (
+			frappe.qb.from_(so_item)
+			.join(so)
+			.on(so.name == so_item.parent)
+			.select(so_item.parent, so_item.idx, so_item.item_code)
+			.where(so_item.name.isin(list(so_items)) & ((so_item.closed == 1) | (so.status == "Closed")))
+			.orderby(so_item.parent, so_item.idx)
+			.limit(1)
+			.run(as_dict=True)
+		)
+		if closed:
+			frappe.throw(
+				_("Row #{0} ({1}) of Sales Order {2} is closed, so it cannot be planned.").format(
+					closed[0].idx, frappe.bold(closed[0].item_code), closed[0].parent
+				),
+				title=_("Sales Order Row Closed"),
+			)
+
+	def get_allocated_references(self):
+		"""Combined references with the qty this plan gives each."""
+		planned_qty = {}
+		for row in self.po_items:
+			key = (self.name, row.sales_order_item)
+			planned_qty[key] = planned_qty.get(key, 0) + flt(row.planned_qty)
+
+		return allocate_reference_qty(self.prod_plan_references, planned_qty)
 
 	def validate_sales_order_planned_qty(self):
 		planned_qty = self.get_so_item_planned_qty()
@@ -330,14 +399,7 @@ class ProductionPlan(Document):
 			return
 
 		already_planned = self.get_so_wise_planned_qty(list({key[0] for key in planned_qty}))
-		so_items = {
-			row.name: row
-			for row in frappe.get_all(
-				"Sales Order Item",
-				filters={"name": ("in", [key[1] for key in planned_qty])},
-				fields=["name", "item_code", "stock_qty", "stock_uom"],
-			)
-		}
+		so_items = self.get_so_items_to_validate([key[1] for key in planned_qty])
 		allowance = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_sales_order")
 		)
@@ -346,7 +408,9 @@ class ProductionPlan(Document):
 		for (sales_order, so_item), qty in planned_qty.items():
 			row = so_items[so_item]
 			unplanned_qty = flt(
-				flt(row.stock_qty) * (1 + allowance / 100) - flt(already_planned.get((sales_order, so_item))),
+				flt(row.stock_qty) * (1 + allowance / 100)
+				- flt(row.reserved_qty)
+				- flt(already_planned.get((sales_order, so_item))),
 				precision,
 			)
 			if flt(qty, precision) > unplanned_qty:
@@ -358,6 +422,24 @@ class ProductionPlan(Document):
 					),
 					title=_("Sales Order Qty Exceeded"),
 				)
+
+	@staticmethod
+	def get_so_items_to_validate(so_items):
+		"""Sales Order Items by name, with the reserved qty that is not their own Work Order output."""
+		so_item = frappe.qb.DocType("Sales Order Item")
+		rows = (
+			frappe.qb.from_(so_item)
+			.select(
+				so_item.name,
+				so_item.item_code,
+				so_item.stock_qty,
+				get_reserved_qty_from_stock(so_item).as_("reserved_qty"),
+				so_item.stock_uom,
+			)
+			.where(so_item.name.isin(so_items))
+			.run(as_dict=True)
+		)
+		return {row.name: row for row in rows}
 
 	def get_so_item_planned_qty(self):
 		"""Planned qty per Sales Order line, excluding product bundle components."""
@@ -482,24 +564,13 @@ class ProductionPlan(Document):
 		):
 			frappe.delete_doc("Work Order", d.name)
 
-	def cancel_untouched_stock_reservations(self):
-		sre_list = frappe.get_all(
-			"Stock Reservation Entry",
-			filters={
-				"voucher_type": self.doctype,
-				"voucher_no": self.name,
-				"docstatus": 1,
-				"status": ("in", ["Reserved", "Partially Reserved"]),
-			},
-			pluck="name",
-		)
-		for sre_name in sre_list:
-			sre_doc = frappe.get_doc("Stock Reservation Entry", sre_name)
-			sre_doc.flags.ignore_permissions = True
-			sre_doc.cancel()
-
 	@frappe.whitelist()
 	def set_status(self, close: bool | None = None, update_bin: bool = False):
+		if close is not None:
+			self.reload()
+			if self.docstatus != 1:
+				frappe.throw(_("Only a submitted Production Plan can be closed or re-opened"))
+
 		self.check_permission("write")
 
 		if close is None and self.status == "Closed":
@@ -509,7 +580,7 @@ class ProductionPlan(Document):
 
 		if close:
 			self.db_set("status", "Closed")
-			self.cancel_untouched_stock_reservations()
+			ProductionPlanStockReservation(self).release_untouched()
 			self.update_bin_qty()
 			self.delete_production_plan_schedule()
 			return
@@ -537,7 +608,8 @@ class ProductionPlan(Document):
 					return
 
 	def update_requested_status(self):
-		if self.mr_items and all(flt(d.requested_qty) >= flt(d.quantity) for d in self.mr_items):
+		rows_to_request = [d for d in self.mr_items if flt(d.quantity) > 0]
+		if rows_to_request and all(flt(d.requested_qty) >= flt(d.quantity) for d in rows_to_request):
 			self.status = "Material Requested"
 
 	def get_production_items(self):
@@ -683,8 +755,11 @@ def get_planned_qty_of_references(sales_orders):
 		.where(reference.parent.isin(plans))
 		.orderby(reference.idx)
 	).run(as_dict=True)
-	planned_qty = get_planned_qty_by_order_row(plans)
+	return allocate_reference_qty(references, get_planned_qty_by_order_row(plans))
 
+
+def allocate_reference_qty(references, planned_qty):
+	"""Split the planned qty of each combined row over its references, in order."""
 	allocated = []
 	for row in references:
 		key = (row.parent, row.item_reference)

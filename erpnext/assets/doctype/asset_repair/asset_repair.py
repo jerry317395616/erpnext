@@ -86,7 +86,7 @@ class AssetRepair(AccountsController):
 			self.update_status()
 
 	def validate_asset(self):
-		if self.asset_doc.status in ("Sold", "Scrapped"):
+		if self.asset_doc.status in ("Sold", "Scrapped", "Capitalized"):
 			frappe.throw(
 				_("Asset {0} is in {1} status and cannot be repaired.").format(
 					get_link_to_form("Asset", self.asset), self.asset_doc.status
@@ -527,11 +527,15 @@ def get_expense_accounts(
 	Get expense accounts for non-stock (service) items from the purchase invoice.
 	Used as a query function for link fields.
 	"""
-	check_asset_repair_access()
-
 	purchase_invoice = filters.get("purchase_invoice")
-	if not purchase_invoice:
+	if not isinstance(purchase_invoice, str) or not purchase_invoice:
 		return []
+
+	company = frappe.db.get_value("Purchase Invoice", purchase_invoice, "company")
+	if not company:
+		return []
+
+	check_asset_repair_access(company)
 
 	expense_accounts = _get_expense_accounts_for_purchase_invoice(purchase_invoice)
 

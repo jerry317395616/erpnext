@@ -243,6 +243,26 @@ class MaterialTransferStockEntry(BaseMaterialTransferStockEntry):
 	def validate(self):
 		self.validate_warehouse()
 		self.validate_same_source_target_warehouse()
+		self.validate_returned_qty_within_subcontracting_order()
+
+	def validate_returned_qty_within_subcontracting_order(self):
+		"""A Return of Components takes back at most what the order still has at the supplier."""
+		if not (self.doc.is_return and self.doc.get("subcontracting_order")):
+			return
+
+		order = frappe.get_doc("Subcontracting Order", self.doc.subcontracting_order)
+		qty_at_supplier = order.get_raw_material_qty_at_supplier()
+		returned_qty = defaultdict(float)
+		for row in self.doc.items:
+			precision = row.precision("transfer_qty")
+			returned_qty[row.item_code] += flt(self.get_stock_qty(row), precision)
+			allowed_qty = flt(qty_at_supplier[row.item_code], precision)
+			if flt(returned_qty[row.item_code], precision) > allowed_qty:
+				frappe.throw(
+					_(
+						"Row #{0}: Only {1} of Item {2} can be returned against Subcontracting Order {3}"
+					).format(row.idx, allowed_qty, row.item_code, order.name)
+				)
 
 	def on_submit(self):
 		self.update_transferred_qty()
@@ -270,7 +290,7 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		self.validate_job_card_for_semi_finished_goods()
 		self.validate_work_order_status_for_return()
 		self.validate_returned_qty_within_work_order()
-		self.validate_component_and_quantities()
+		self.validate_returned_fg_qty_within_job_card()
 		self.validate_same_source_target_warehouse()
 		self.validate_alternative_items()
 
@@ -300,10 +320,13 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		if not (self.doc.is_return and self.wo_doc) or self.wo_doc.status in ("Completed", "Closed"):
 			return
 
+		if self.doc.job_card and frappe.db.get_value("Job Card", self.doc.job_card, "docstatus") == 0:
+			return
+
 		frappe.throw(
-			_("Components can be returned only after Work Order {0} is Completed or Closed").format(
-				get_link_to_form("Work Order", self.doc.work_order)
-			),
+			_(
+				"Components can be returned only against a draft Job Card, or after Work Order {0} is Completed or Closed"
+			).format(get_link_to_form("Work Order", self.doc.work_order)),
 			title=_("Work Order Not Finished"),
 		)
 
@@ -311,25 +334,57 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		if not (self.doc.is_return and self.wo_doc):
 			return
 
-		returnable_qty = self.get_returnable_qty()
-		for item_code, returned_qty in self.get_returned_qty_by_item().items():
+		returned_qty_by_item = self.get_returned_qty_by_item()
+		if self.doc.job_card:
+			self.validate_returned_qty_within(
+				returned_qty_by_item, "Job Card", self.doc.job_card, self.get_returnable_qty()
+			)
+
+		self.validate_returned_qty_within(
+			returned_qty_by_item,
+			"Work Order",
+			self.wo_doc.name,
+			self.get_returnable_qty(scope_to_job_card=False),
+		)
+
+	def validate_returned_qty_within(self, returned_qty_by_item, doctype, name, returnable_qty):
+		for item_code, returned_qty in returned_qty_by_item.items():
 			if flt(returned_qty, 6) > flt(returnable_qty[item_code], 6):
 				frappe.throw(
 					_(
-						"Item {0}: cannot return {1} to the store, Work Order {2} has only {3} of it left unconsumed."
+						"Item {0}: cannot return {1} to the store, {2} {3} has only {4} of it left unconsumed."
 					).format(
 						frappe.bold(item_code),
 						flt(returned_qty),
-						get_link_to_form("Work Order", self.wo_doc.name),
+						_(doctype),
+						get_link_to_form(doctype, name),
 						flt(returnable_qty[item_code]),
 					),
 					title=_("Excess Return"),
 				)
 
-	def get_returnable_qty(self) -> dict:
+	def validate_returned_fg_qty_within_job_card(self):
+		if not (self.doc.is_return and self.doc.job_card):
+			return
+
+		transferred_qty = frappe.db.get_value("Job Card", self.doc.job_card, "transferred_qty")
+		if flt(self.doc.fg_completed_qty, 6) > flt(transferred_qty, 6):
+			frappe.throw(
+				_(
+					"Return quantity {0} is more than the quantity {1} transferred against Job Card {2}."
+				).format(
+					flt(self.doc.fg_completed_qty),
+					flt(transferred_qty),
+					get_link_to_form("Job Card", self.doc.job_card),
+				),
+				title=_("Excess Return"),
+			)
+
+	def get_returnable_qty(self, scope_to_job_card=True) -> dict:
 		from .manufacturing import ManufactureStockEntry
 
 		available = ManufactureStockEntry(self.doc)
+		available.scope_return_to_job_card = scope_to_job_card
 		available.prepare_available_materials_based_on_transfer()
 		returnable_qty = defaultdict(float)
 		for row in available._transfer_entries or []:
@@ -349,6 +404,9 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 		return qty_by_item
 
 	def validate_component_and_quantities(self):
+		if self.doc.is_return:
+			return
+
 		if self.doc.fg_completed_qty:
 			if (
 				frappe.db.get_single_value("Manufacturing Settings", "validate_components_quantities_per_bom")
@@ -361,23 +419,23 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 			self._validate_no_excess_transfer()
 
 	def _validate_no_excess_transfer(self):
-		if self.doc.is_return:
-			return
-
-		if (
-			frappe.db.get_single_value("Manufacturing Settings", "backflush_raw_materials_based_on")
-			== "Material Transferred for Manufacture"
-		):
+		if self.backflush_based_on == "Material Transferred for Manufacture":
 			return
 
 		wo = self.wo_doc
 		if not wo:
 			return
 
+		from erpnext.manufacturing.doctype.work_order.services.required_items import (
+			get_allowed_transfer_qty,
+		)
+
 		pending_by_item = {}
 		for r in wo.required_items:
 			pending_by_item[r.item_code] = (
-				pending_by_item.get(r.item_code, 0.0) + flt(r.required_qty) - flt(r.transferred_qty)
+				pending_by_item.get(r.item_code, 0.0)
+				+ get_allowed_transfer_qty(r.required_qty)
+				- flt(r.transferred_qty)
 			)
 
 		transfer_by_item = {}
@@ -484,13 +542,10 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 			else None
 		)
 		wip_warehouse = self._resolve_wip_warehouse(work_order)
-		extra_pct = flt(
-			frappe.db.get_single_value("Manufacturing Settings", "transfer_extra_materials_percentage")
-		)
 		item_dict = frappe._dict()
 		for d in work_order.get("required_items"):
 			self._add_required_item(
-				item_dict, d, consider_job_card, job_card_items, wip_warehouse, extra_pct, work_order
+				item_dict, d, consider_job_card, job_card_items, wip_warehouse, work_order
 			)
 		return item_dict
 
@@ -505,19 +560,16 @@ class MaterialTransferForManufactureStockEntry(BaseMaterialTransferStockEntry):
 			return work_order.wip_warehouse
 		return None
 
-	def _add_required_item(
-		self, item_dict, d, consider_job_card, job_card_items, wip_warehouse, extra_pct, work_order
-	):
+	def _add_required_item(self, item_dict, d, consider_job_card, job_card_items, wip_warehouse, work_order):
+		from erpnext.manufacturing.doctype.work_order.services.required_items import (
+			get_allowed_transfer_qty,
+		)
+
 		if consider_job_card and d.item_code not in job_card_items:
 			return
 		if consider_job_card and not self._is_row_of_job_card_operation(d):
 			return
-		additional_qty = extra_pct * flt(d.required_qty) / 100 if extra_pct else 0.0
-		transfer_pending = (
-			(flt(d.required_qty) + additional_qty) > flt(d.transferred_qty)
-			if additional_qty
-			else flt(d.required_qty) > flt(d.transferred_qty)
-		)
+		transfer_pending = get_allowed_transfer_qty(d.required_qty) > flt(d.transferred_qty)
 		can_transfer = transfer_pending or self.backflush_based_on == "Material Transferred for Manufacture"
 		if not can_transfer or not d.include_item_in_manufacturing:
 			return

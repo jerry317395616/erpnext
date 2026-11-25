@@ -138,6 +138,7 @@ class Opportunity(TransactionBase, CRMNote):
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_cust_name()
 		self.validate_party()
+		self.validate_party_specific_items()
 		self.validate_party_contact_and_address()
 		self.refresh_party_fields()
 		self.map_fields()
@@ -166,6 +167,11 @@ class Opportunity(TransactionBase, CRMNote):
 	def on_trash(self):
 		frappe.db.delete("Prospect Opportunity", {"opportunity": self.name})
 
+	def validate_party_specific_items(self):
+		from erpnext.accounts.services.party_validation import PartyValidator
+
+		PartyValidator(self).validate_party_specific_items()
+
 	def validate_opportunity_from(self):
 		if self.opportunity_from not in PARTY_DOCTYPES:
 			frappe.throw(
@@ -182,26 +188,27 @@ class Opportunity(TransactionBase, CRMNote):
 				)
 
 	def validate_status(self):
-		"""Quotation and Converted come from the linked quotations and can't be set or left by hand."""
+		"""Refuse a status set by hand only where it contradicts the linked quotations."""
 		if self.is_new() or not self.has_value_changed("status"):
 			return
 
-		quotation_status = self.get_quotation_status()
-		if self.status != quotation_status and (
-			quotation_status or self.status in ("Quotation", "Converted")
-		):
-			if self.status == "Lost":
-				frappe.throw(_("Cannot declare as Lost because an active Quotation exists."))
-			frappe.throw(
-				_("Status {0} is set from the Opportunity's Quotations").format(
-					frappe.bold(_(quotation_status or self.status))
-				)
-			)
-
+		self.validate_status_against_quotations(self.get_quotation_status())
 		previous = self.get_doc_before_save()
 		if previous and previous.status == "Lost":
 			self.lost_reasons = []
 			self.order_lost_reason = None
+
+	def validate_status_against_quotations(self, quotation_status: str | None) -> None:
+		if self.status == "Lost" and quotation_status:
+			frappe.throw(_("Cannot declare as Lost because an active Quotation exists."))
+
+		if self.status in ("Quotation", "Converted") and self.status != quotation_status:
+			frappe.throw(
+				_("Status {0} is set from the Opportunity's Quotations").format(frappe.bold(_(self.status)))
+			)
+
+		if quotation_status == "Converted" and self.status != "Converted":
+			frappe.throw(_("Status cannot be changed because an ordered Quotation exists."))
 
 	def get_quotation_status(self) -> str | None:
 		if self.has_ordered_quotation():
@@ -243,7 +250,9 @@ class Opportunity(TransactionBase, CRMNote):
 			return
 
 		if not self.conversion_rate or self.conversion_rate == 1.0 or self.is_currency_changed_alone():
-			self.conversion_rate = get_exchange_rate(self.currency, company_currency, self.transaction_date)
+			self.conversion_rate = get_exchange_rate(
+				self.currency, company_currency, self.transaction_date, "for_selling"
+			)
 
 	def is_currency_changed_alone(self) -> bool:
 		return (

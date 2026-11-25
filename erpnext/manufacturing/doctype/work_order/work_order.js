@@ -85,7 +85,7 @@ frappe.ui.form.on("Work Order", {
 
 		// formatter for work order operation
 		frm.set_indicator_formatter("operation", function (doc) {
-			return frm.doc.qty == doc.completed_qty ? "green" : "orange";
+			return doc.status === "Completed" ? "green" : "orange";
 		});
 
 		frm.fields_dict["non_stock_items"].grid.set_column_disp_in_list_view("secondary_item_type", false);
@@ -211,7 +211,11 @@ frappe.ui.form.on("Work Order", {
 			}
 		}
 
-		let pending_ops = frm.doc?.operations?.filter((op) => op.completed_qty < frm.doc.qty);
+		let pending_ops = frm.doc?.operations?.filter(
+			(op) =>
+				flt(flt(op.completed_qty) + flt(op.process_loss_qty), precision("completed_qty", op)) <
+				erpnext.work_order.get_operation_target_qty(frm, op)
+		);
 		// Jump to the operator Shop Floor view, pre-filtered to this work order.
 		if (frm.doc.docstatus === 1 && frm.doc.status !== "Closed" && pending_ops && pending_ops.length > 0) {
 			frm.add_custom_button(__("Operator Dashboard"), () => {
@@ -236,8 +240,7 @@ frappe.ui.form.on("Work Order", {
 		if (
 			frm.doc.docstatus === 1 &&
 			["Closed", "Completed"].includes(frm.doc.status) &&
-			frm.doc.produced_qty > 0 &&
-			frm.doc.produced_qty > frm.doc.disassembled_qty
+			erpnext.work_order.get_disassemblable_qty(frm) > 0
 		) {
 			frm.add_custom_button(
 				__("Disassemble Order"),
@@ -292,7 +295,7 @@ frappe.ui.form.on("Work Order", {
 
 	has_unreserved_stock(frm) {
 		let has_unreserved_stock = frm.doc.required_items.some(
-			(item) => flt(item.required_qty) > flt(item.stock_reserved_qty)
+			(item) => erpnext.stock_reservation.get_work_order_unreserved_qty(item) > 0
 		);
 
 		return has_unreserved_stock;
@@ -311,11 +314,19 @@ frappe.ui.form.on("Work Order", {
 
 	add_custom_button_to_return_components: function (frm) {
 		if (frm.doc.docstatus === 1 && ["Closed", "Completed"].includes(frm.doc.status)) {
-			let non_consumed_items = frm.doc.required_items.filter((d) => {
-				return flt(d.consumed_qty) < flt(d.transferred_qty - d.returned_qty);
+			// per item, since rows of one item split transfers by warehouse but consumption by required qty
+			let pending_qty_by_item = {};
+			frm.doc.required_items.forEach((d) => {
+				// consumed_qty already includes returned_qty
+				pending_qty_by_item[d.item_code] =
+					flt(pending_qty_by_item[d.item_code]) + flt(d.transferred_qty) - flt(d.consumed_qty);
 			});
 
-			if (non_consumed_items && non_consumed_items.length) {
+			let has_pending_qty = Object.values(pending_qty_by_item).some(
+				(qty) => flt(qty, precision("transferred_qty", frm.doc.required_items[0])) > 0
+			);
+
+			if (has_pending_qty) {
 				frm.add_custom_button(__("Return Components"), function () {
 					frm.trigger("create_stock_return_entry");
 				});
@@ -356,9 +367,10 @@ frappe.ui.form.on("Work Order", {
 
 				if (!flt(r.message.available_qty)) {
 					frappe.msgprint(
-						__("The produced qty of the item {0} has already been converted in full.", [
-							frm.doc.production_item.bold(),
-						])
+						__(
+							"The produced qty of the item {0} has already been converted or disassembled in full.",
+							[frm.doc.production_item.bold()]
+						)
 					);
 					return;
 				}
@@ -532,10 +544,14 @@ frappe.ui.form.on("Work Order", {
 
 		var pending_qty = 0;
 		frm.doc.operations.forEach((data) => {
-			if (data.completed_qty + data.process_loss_qty != frm.doc.qty) {
-				pending_qty = frm.doc.qty - flt(data.completed_qty) - flt(data.process_loss_qty);
+			let operation_qty = erpnext.work_order.get_operation_target_qty(frm, data);
+			if (data.completed_qty + data.process_loss_qty != operation_qty) {
+				pending_qty = flt(
+					operation_qty - flt(data.completed_qty) - flt(data.process_loss_qty),
+					precision("completed_qty", data)
+				);
 
-				if (pending_qty) {
+				if (pending_qty > 0) {
 					dialog.fields_dict.operations.df.data.push({
 						__checked: 1,
 						name: data.name,
@@ -679,10 +695,15 @@ frappe.ui.form.on("Work Order", {
 			let total_completed_qty = frm.doc.qty * frm.doc.operations.length;
 
 			frm.doc.operations.forEach((d) => {
+				let operation_qty = erpnext.work_order.get_operation_target_qty(frm, d);
+				let completed_qty = operation_qty
+					? Math.min((flt(d.completed_qty) + flt(d.process_loss_qty)) / operation_qty, 1) *
+					  frm.doc.qty
+					: frm.doc.qty;
 				if (!status_wise_oprtation_data[d.status]) {
-					status_wise_oprtation_data[d.status] = [d.completed_qty, d.operation];
+					status_wise_oprtation_data[d.status] = [completed_qty, d.operation];
 				} else {
-					status_wise_oprtation_data[d.status][0] += d.completed_qty;
+					status_wise_oprtation_data[d.status][0] += completed_qty;
 					status_wise_oprtation_data[d.status][1] += ", " + d.operation;
 				}
 			});
@@ -872,6 +893,18 @@ frappe.ui.form.on("Work Order Operation", {
 });
 
 erpnext.work_order = {
+	get_operation_qty(frm, row) {
+		if (frm.doc.track_semi_finished_goods && flt(row.output_qty)) {
+			return flt(row.output_qty);
+		}
+
+		return flt(frm.doc.qty);
+	},
+
+	get_operation_target_qty(frm, row) {
+		return flt(frm.doc.__onload?.operation_target_qty?.[row.name] ?? this.get_operation_qty(frm, row));
+	},
+
 	set_custom_buttons: function (frm) {
 		var doc = frm.doc;
 		frm.has_start_btn = false;
@@ -1003,12 +1036,7 @@ erpnext.work_order = {
 							frm.add_custom_button(
 								__("Material Consumption"),
 								function () {
-									const backflush_raw_materials_based_on =
-										frm.doc.__onload.backflush_raw_materials_based_on;
-									erpnext.work_order.make_consumption_se(
-										frm,
-										backflush_raw_materials_based_on
-									);
+									erpnext.work_order.make_consumption_se(frm);
 								},
 								__("Create")
 							);
@@ -1018,17 +1046,21 @@ erpnext.work_order = {
 
 				if (!frm.doc.skip_transfer) {
 					if (flt(doc.material_transferred_for_manufacturing) > 0) {
-						if (flt(doc.produced_qty) < flt(doc.material_transferred_for_manufacturing)) {
-							frm.has_finish_btn = true;
-
-							let finish_btn = frm.add_custom_button(__("Finish"), function () {
-								erpnext.work_order.make_se(frm, "Manufacture");
-							});
-
-							if (doc.material_transferred_for_manufacturing >= doc.qty) {
-								// all materials transferred for manufacturing, make this primary
-								finish_btn.addClass("btn-primary");
-							}
+						const remaining_qty = flt(
+							flt(doc.material_transferred_for_manufacturing) -
+								flt(doc.produced_qty) -
+								flt(doc.process_loss_qty),
+							precision("qty")
+						);
+						if (remaining_qty > 0) {
+							frm.add_custom_button(
+								__("Finish"),
+								function () {
+									erpnext.work_order.make_se(frm, "Manufacture");
+								},
+								null,
+								doc.material_transferred_for_manufacturing >= doc.qty ? "primary" : "default"
+							);
 						} else if (frm.doc.__onload && frm.doc.__onload.overproduction_percentage) {
 							let allowance_percentage = frm.doc.__onload.overproduction_percentage;
 
@@ -1045,10 +1077,14 @@ erpnext.work_order = {
 					}
 				} else {
 					if (flt(doc.produced_qty) < flt(doc.qty)) {
-						let finish_btn = frm.add_custom_button(__("Finish"), function () {
-							erpnext.work_order.make_se(frm, "Manufacture");
-						});
-						finish_btn.addClass("btn-primary");
+						frm.add_custom_button(
+							__("Finish"),
+							function () {
+								erpnext.work_order.make_se(frm, "Manufacture");
+							},
+							null,
+							"primary"
+						);
 					}
 				}
 			}
@@ -1062,10 +1098,14 @@ erpnext.work_order = {
 			return;
 		}
 
-		const start_btn = frm.add_custom_button(__("Start"), () => {
-			erpnext.work_order.make_se(frm, "Material Transfer for Manufacture");
-		});
-		start_btn.addClass("btn-primary");
+		frm.add_custom_button(
+			__("Start"),
+			() => {
+				erpnext.work_order.make_se(frm, "Material Transfer for Manufacture");
+			},
+			null,
+			"primary"
+		);
 	},
 
 	setup_stock_reservation(frm) {
@@ -1122,7 +1162,7 @@ erpnext.work_order = {
 	},
 
 	set_default_warehouse: function (frm) {
-		if (frm.doc.company && !(frm.doc.wip_warehouse || frm.doc.fg_warehouse)) {
+		if (frm.doc.company && !frm.doc.wip_warehouse) {
 			let company = frm.doc.company;
 			frappe.call({
 				method: "erpnext.manufacturing.doctype.work_order.work_order.get_default_warehouse",
@@ -1143,7 +1183,7 @@ erpnext.work_order = {
 	get_max_transferable_qty: (frm, purpose) => {
 		let max = 0;
 		if (purpose === "Disassemble") {
-			return flt(frm.doc.produced_qty - frm.doc.disassembled_qty);
+			return erpnext.work_order.get_disassemblable_qty(frm);
 		}
 
 		if (frm.doc.skip_transfer) {
@@ -1163,7 +1203,7 @@ erpnext.work_order = {
 			return 0;
 		}
 
-		const total_loss = Math.max(...frm.doc.operations.map((row) => flt(row.process_loss_qty)));
+		const total_loss = flt(frm.doc.__onload?.upstream_process_loss);
 		return flt(Math.max(total_loss - flt(frm.doc.process_loss_qty), 0), precision("qty"));
 	},
 
@@ -1173,9 +1213,9 @@ erpnext.work_order = {
 		(frm.doc.required_items || []).forEach((row) => {
 			required[row.item_code] = (required[row.item_code] || 0) + flt(row.required_qty);
 			if (!(row.item_code in covered)) {
-				covered[row.item_code] =
-					flt(row.transferred_qty) + flt(row.requested_qty) + flt(row.picked_qty);
+				covered[row.item_code] = flt(row.requested_qty) + flt(row.picked_qty);
 			}
+			covered[row.item_code] += flt(row.transferred_qty);
 		});
 
 		let max_fraction = 0;
@@ -1184,11 +1224,22 @@ erpnext.work_order = {
 			const pending = required[item_code] - covered[item_code];
 			max_fraction = Math.max(max_fraction, pending / required[item_code]);
 		});
-		return flt(max_fraction * flt(frm.doc.qty), precision("qty"));
+		// round up, so a pending qty below the qty precision is still requestable;
+		// the server caps each item at its pending qty
+		const factor = Math.pow(10, precision("qty"));
+		return flt(Math.ceil(flt(max_fraction * flt(frm.doc.qty) * factor, 9)) / factor, precision("qty"));
+	},
+
+	get_disassemblable_qty: (frm) => {
+		// produced qty not yet disassembled or converted to an alternative item
+		return flt(
+			frm.doc.produced_qty - frm.doc.disassembled_qty - flt(frm.doc.__onload?.converted_fg_qty),
+			precision("qty")
+		);
 	},
 
 	show_disassembly_prompt: function (frm) {
-		let max_qty = flt(frm.doc.produced_qty - frm.doc.disassembled_qty);
+		let max_qty = this.get_disassemblable_qty(frm);
 
 		let fields = [
 			{
@@ -1212,10 +1263,11 @@ erpnext.work_order = {
 					let se_name = this.value;
 					let qty = max_qty;
 					if (se_name) {
-						qty = await frappe.xcall(
+						const source_qty = await frappe.xcall(
 							"erpnext.manufacturing.doctype.work_order.work_order.get_disassembly_available_qty",
 							{ stock_entry_name: se_name }
 						);
+						qty = Math.min(max_qty, source_qty);
 					}
 
 					frm.disassembly_prompt.set_value("qty", qty);
@@ -1241,11 +1293,26 @@ erpnext.work_order = {
 		});
 	},
 
+	get_allowance_percentage: (frm, purpose) => {
+		// same as the server: transfers use Transfer Extra %, falling back to Overproduction %
+		const overproduction = flt(frm.doc.__onload?.overproduction_percentage);
+		if (purpose === "Material Transfer for Manufacture") {
+			return flt(frm.doc.__onload?.transfer_extra_materials_percentage) || overproduction;
+		}
+		return overproduction;
+	},
+
 	show_prompt_for_qty_input: function (frm, purpose, { qty, additional_transfer_entry, target } = {}) {
 		let max = qty == null ? this.get_max_transferable_qty(frm, purpose) : qty;
 		if (purpose === "Manufacture") {
 			max = flt(Math.max(max - flt(frm.doc.process_loss_qty), 0), precision("qty"));
 		}
+		// a passed qty is already the caller's cap
+		const allowance =
+			qty == null ? (flt(frm.doc.qty) * this.get_allowance_percentage(frm, purpose)) / 100 : 0;
+		const allowed_qty = flt(max + allowance, precision("qty"));
+		// only the allowance may be left
+		const default_qty = max || allowed_qty;
 		const pending_process_loss =
 			purpose === "Manufacture" ? this.get_pending_operation_process_loss(frm) : 0;
 
@@ -1254,8 +1321,8 @@ erpnext.work_order = {
 				fieldtype: "Float",
 				label: __("Qty for {0}", [target || __(purpose)]),
 				fieldname: "qty",
-				description: __("Max: {0}", [max]),
-				default: max,
+				description: __("Max: {0}", [allowed_qty]),
+				default: default_qty,
 				onchange: function () {
 					if (pending_process_loss && frm.qty_prompt) {
 						frm.qty_prompt.set_value(
@@ -1281,7 +1348,7 @@ erpnext.work_order = {
 					fieldtype: "Float",
 					label: __("Finished Good Qty"),
 					fieldname: "finished_good_qty",
-					default: flt(Math.max(max - pending_process_loss, 0), precision("qty")),
+					default: flt(Math.max(default_qty - pending_process_loss, 0), precision("qty")),
 					read_only: 1,
 					description: __("Actual quantity of the finished good that will be manufactured."),
 				}
@@ -1292,15 +1359,13 @@ erpnext.work_order = {
 			frm.qty_prompt = frappe.prompt(
 				fields,
 				(data) => {
-					max += (frm.doc.qty * (frm.doc.__onload.overproduction_percentage || 0.0)) / 100;
-
 					if (!data.qty || data.qty <= 0) {
 						frappe.msgprint(__("Quantity must be greater than zero."));
 						reject();
 						return;
 					}
-					if (data.qty > max) {
-						frappe.msgprint(__("Quantity must not be more than {0}", [max]));
+					if (data.qty > allowed_qty) {
+						frappe.msgprint(__("Quantity must not be more than {0}", [allowed_qty]));
 						reject();
 						return;
 					}
@@ -1327,12 +1392,16 @@ erpnext.work_order = {
 	},
 
 	make_se: function (frm, purpose, qty, is_additional_transfer_entry) {
-		if (qty) {
+		const only_leftover_items_pending =
+			purpose === "Material Transfer for Manufacture" &&
+			this.get_max_transferable_qty(frm, purpose) <= 0;
+
+		if (qty || only_leftover_items_pending) {
 			frappe
 				.xcall("erpnext.manufacturing.doctype.work_order.mapper.make_stock_entry", {
 					work_order_id: frm.doc.name,
 					purpose: purpose,
-					qty: qty,
+					qty: qty || 0,
 					is_additional_transfer_entry: is_additional_transfer_entry || 0,
 				})
 				.then((stock_entry) => {
@@ -1399,24 +1468,13 @@ erpnext.work_order = {
 		}).then((data) => get_pick_list(data.qty));
 	},
 
-	make_consumption_se: function (frm, backflush_raw_materials_based_on) {
-		let max = 0;
-		if (!frm.doc.skip_transfer) {
-			max =
-				backflush_raw_materials_based_on === "Material Transferred for Manufacture"
-					? flt(frm.doc.material_transferred_for_manufacturing) - flt(frm.doc.produced_qty)
-					: flt(frm.doc.qty) - flt(frm.doc.produced_qty);
-			// flt(frm.doc.qty) - flt(frm.doc.material_transferred_for_manufacturing);
-		} else {
-			max = flt(frm.doc.qty) - flt(frm.doc.produced_qty);
-		}
-
+	make_consumption_se: function (frm) {
+		// the server proposes the qty still to consume
 		frappe.call({
 			method: "erpnext.manufacturing.doctype.work_order.mapper.make_stock_entry",
 			args: {
 				work_order_id: frm.doc.name,
 				purpose: "Material Consumption for Manufacture",
-				qty: max,
 			},
 			callback: function (r) {
 				var doclist = frappe.model.sync(r.message);
@@ -1575,7 +1633,19 @@ erpnext.work_order.LinkedLists = class WorkOrderLinkedLists {
 			job_card_tab: {
 				html_field: "job_card_list_html",
 				doctype: "Job Card",
-				fields: ["name", "status", "docstatus", "operation", "workstation", "for_quantity"],
+				list_overrides: {
+					get_page: (args) => erpnext.work_order.get_job_card_page(this.frm, args),
+					after_render() {
+						erpnext.work_order.bind_job_card_timer_actions(this);
+						// render() skips render_more when there are no rows
+						if (!this.data.length) erpnext.work_order.sync_job_card_rows(this);
+					},
+					// also runs on Load More, which skips after_render
+					render_more() {
+						this.constructor.prototype.render_more.call(this);
+						erpnext.work_order.sync_job_card_rows(this);
+					},
+				},
 				columns: [
 					{
 						label: __("Job Card"),
@@ -1595,6 +1665,16 @@ erpnext.work_order.LinkedLists = class WorkOrderLinkedLists {
 							];
 							return frappe.ui.badge.html({ label, theme: color });
 						},
+					},
+					{
+						label: __("Time"),
+						width: "1%",
+						render: (row) => erpnext.work_order.job_card_time_html(row),
+					},
+					{
+						label: "",
+						width: "1%",
+						render: (row) => erpnext.work_order.job_card_actions_html(row),
 					},
 				],
 			},
@@ -1676,6 +1756,7 @@ erpnext.work_order.LinkedLists = class WorkOrderLinkedLists {
 			.require("embedded_list.bundle.js")
 			.then(() => {
 				this._loaded = true;
+				this.stop_timers();
 				this.lists = {};
 				this.load_active_tab();
 			})
@@ -1706,6 +1787,7 @@ erpnext.work_order.LinkedLists = class WorkOrderLinkedLists {
 			empty_state_action: can_add ? cfg.empty_state_action : undefined,
 			empty_description: cfg.empty_description,
 			empty_message: cfg.empty_message || __("No {0} linked to this Work Order.", [__(cfg.doctype)]),
+			...cfg.list_overrides,
 		};
 		const ListClass = erpnext.work_order.get_embedded_list_class();
 		const list = new ListClass(opts);
@@ -1729,4 +1811,264 @@ erpnext.work_order.LinkedLists = class WorkOrderLinkedLists {
 			this.build(fieldname);
 		}
 	}
+
+	stop_timers() {
+		Object.values(this.lists).forEach((list) => erpnext.work_order.stop_job_card_ticker(list));
+	}
+};
+
+erpnext.work_order.get_job_card_page = function (frm, { start, page_length, txt }) {
+	return frappe
+		.xcall("erpnext.manufacturing.doctype.job_card.timer.get_work_order_job_cards", {
+			work_order: frm.doc.name,
+			start,
+			page_length,
+			txt,
+		})
+		.then(erpnext.work_order.stamp_fetched_at);
+};
+
+// keep in sync with SEARCH_FIELDS in job_card/timer.py
+erpnext.work_order.JOB_CARD_SEARCH_FIELDS = ["name", "operation", "workstation", "status"];
+
+erpnext.work_order.job_card_matches_search = function (row, txt) {
+	const term = txt.toLowerCase();
+	return erpnext.work_order.JOB_CARD_SEARCH_FIELDS.some((field) =>
+		String(row[field] ?? "")
+			.toLowerCase()
+			.includes(term)
+	);
+};
+
+erpnext.work_order.stamp_fetched_at = function (rows) {
+	const fetched_at = Date.now();
+	rows.forEach((row) => (row.fetched_at = fetched_at));
+	return rows;
+};
+
+erpnext.work_order.JOB_CARD_TIMER_ACTIONS = {
+	start: { icon: "play", label: __("Start") },
+	resume: { icon: "play", label: __("Resume") },
+	pause: { icon: "pause", label: __("Pause") },
+	// opens the form: completing needs its quantity dialog
+	complete: {
+		icon: "check",
+		label: __("Complete"),
+		title: __("Complete in Job Card"),
+		show_label: true,
+	},
+};
+
+erpnext.work_order.get_job_card_row_actions = function (row) {
+	if (!row.timer_action) return [];
+	return row.timer_action === "pause" ? ["pause", "complete"] : [row.timer_action];
+};
+
+erpnext.work_order.job_card_time_html = function (row) {
+	return `<span class="job-card-timer${row.is_running ? "" : " text-muted"}"
+		style="font-variant-numeric: tabular-nums;"
+		data-job-card="${frappe.utils.escape_html(row.name)}">${erpnext.work_order.format_job_card_elapsed(
+		row
+	)}</span>`;
+};
+
+erpnext.work_order.job_card_actions_html = function (row) {
+	const name = frappe.utils.escape_html(row.name);
+	const buttons = erpnext.work_order
+		.get_job_card_row_actions(row)
+		.map((action_name) => {
+			const action = erpnext.work_order.JOB_CARD_TIMER_ACTIONS[action_name];
+			return frappe.ui.button.html({
+				label: action.show_label ? action.label : "",
+				icon: action.icon,
+				size: "xs",
+				title: action.title || action.label,
+				// button.html escapes attrs itself
+				attrs: { "data-timer-action": action_name, "data-job-card": row.name },
+			});
+		})
+		.join("");
+
+	return `<span class="job-card-actions inline-flex gap-1 embedded-list-hover-reveal" data-job-card="${name}">${buttons}</span>`;
+};
+
+// in-progress cards, else the next card to start, keep buttons visible; the rest on hover
+erpnext.work_order.show_persistent_job_card_actions = function (list) {
+	const persistent = erpnext.work_order.get_persistent_job_cards(list.data);
+	list.$wrapper.find(".job-card-actions").each((_, element) => {
+		const $actions = $(element);
+		$actions.toggleClass("embedded-list-hover-reveal", !persistent.has($actions.attr("data-job-card")));
+	});
+};
+
+erpnext.work_order.get_persistent_job_cards = function (rows) {
+	const in_progress = rows.filter((row) => ["pause", "resume"].includes(row.timer_action));
+	if (in_progress.length) {
+		return new Set(in_progress.map((row) => row.name));
+	}
+
+	// rows come in operation order, so the first startable one is next
+	const next = rows.find((row) => row.timer_action === "start");
+	return new Set(next ? [next.name] : []);
+};
+
+erpnext.work_order.format_job_card_elapsed = function (row) {
+	const live_seconds = (row.open_log_count * (Date.now() - row.fetched_at)) / 1000;
+	const total = Math.floor(row.elapsed_seconds + live_seconds);
+	const pad = (n) => String(n).padStart(2, "0");
+	return `${pad(Math.floor(total / 3600))}:${pad(Math.floor((total % 3600) / 60))}:${pad(total % 60)}`;
+};
+
+erpnext.work_order.bind_job_card_timer_actions = function (list) {
+	list.$wrapper.off("click.job_card_timer").on("click.job_card_timer", "[data-timer-action]", (e) => {
+		e.preventDefault();
+		e.stopPropagation();
+		const $button = $(e.currentTarget);
+		const row = list.data.find((r) => r.name === $button.attr("data-job-card"));
+		if (!row) return;
+
+		erpnext.work_order.run_once_per_job_card(list, row.name, () =>
+			erpnext.work_order.run_job_card_timer_action(list, row, $button.attr("data-timer-action"))
+		);
+	});
+};
+
+// ignores repeat clicks while a card's action runs
+erpnext.work_order.run_once_per_job_card = function (list, job_card, run) {
+	list.pending_job_cards = list.pending_job_cards || new Set();
+	if (list.pending_job_cards.has(job_card)) return;
+
+	list.pending_job_cards.add(job_card);
+	const $buttons = list.$wrapper
+		.find(`[data-timer-action][data-job-card="${CSS.escape(job_card)}"]`)
+		.prop("disabled", true);
+
+	Promise.resolve()
+		.then(run)
+		.finally(() => {
+			list.pending_job_cards.delete(job_card);
+			$buttons.prop("disabled", false);
+		});
+};
+
+erpnext.work_order.run_job_card_timer_action = function (list, row, action) {
+	const now = frappe.datetime.system_datetime();
+	if (action === "complete") {
+		return frappe.set_route("Form", "Job Card", row.name);
+	}
+	if (action === "start") {
+		return erpnext.work_order.start_job_card(list, row);
+	}
+	if (action === "pause") {
+		return erpnext.work_order.update_job_card(list, row.name, "pause_job", { end_time: now });
+	}
+	return erpnext.work_order.update_job_card(list, row.name, "resume_job", { start_time: now });
+};
+
+erpnext.work_order.sync_job_card_rows = function (list) {
+	erpnext.work_order.show_persistent_job_card_actions(list);
+	erpnext.work_order.sync_job_card_ticker(list);
+};
+
+// ticks only while a loaded row has an open log
+erpnext.work_order.sync_job_card_ticker = function (list) {
+	list.ticking_rows = list.data.filter((row) => row.open_log_count > 0);
+	if (!list.ticking_rows.length) {
+		erpnext.work_order.stop_job_card_ticker(list);
+		return;
+	}
+	if (list.timer_interval) return;
+
+	list.timer_interval = setInterval(() => {
+		if (document.hidden || !list.$wrapper.is(":visible")) return;
+		list.ticking_rows.forEach((row) => {
+			list.$wrapper
+				.find(`.job-card-timer[data-job-card="${CSS.escape(row.name)}"]`)
+				.text(erpnext.work_order.format_job_card_elapsed(row));
+		});
+	}, 1000);
+};
+
+erpnext.work_order.stop_job_card_ticker = function (list) {
+	clearInterval(list.timer_interval);
+	list.timer_interval = null;
+};
+
+erpnext.work_order.start_job_card = function (list, row) {
+	const start = (employees) =>
+		erpnext.work_order.update_job_card(list, row.name, "start_timer", {
+			start_time: frappe.datetime.system_datetime(),
+			employees,
+		});
+
+	if (row.employees.length) {
+		return start(row.employees.map((employee) => ({ employee })));
+	}
+
+	// start time is taken on submit, so picking operators isn't counted
+	return new Promise((resolve) => {
+		let request = null;
+		const dialog = frappe.prompt(
+			{
+				fieldtype: "Table MultiSelect",
+				label: __("Select Employees"),
+				options: "Job Card Time Log",
+				fieldname: "employees",
+				reqd: 1,
+				filters: { status: "Active" },
+			},
+			(values) => (request = start(values.employees)),
+			__("Assign Job to Employee")
+		);
+		// onhide fires before the submit callback
+		dialog.onhide = () => setTimeout(() => resolve(request));
+	});
+};
+
+erpnext.work_order.update_job_card = function (list, job_card, method, args) {
+	const reload_row = () =>
+		frappe
+			.xcall("erpnext.manufacturing.doctype.job_card.timer.get_job_card_timer", { job_card })
+			.then((row) => erpnext.work_order.replace_job_card_row(list, row));
+
+	return (
+		frappe
+			.xcall("erpnext.manufacturing.doctype.workstation.workstation.update_job_card", {
+				job_card,
+				method,
+				...args,
+			})
+			// a failure often means the card changed elsewhere; xcall has shown the error already
+			.then(reload_row, reload_row)
+	);
+};
+
+erpnext.work_order.replace_job_card_row = function (list, row) {
+	erpnext.work_order.stamp_fetched_at([row]);
+	const index = list.data.findIndex((r) => r.name === row.name);
+	if (index === -1) return;
+
+	const txt = list.search_term();
+	if (txt && !erpnext.work_order.job_card_matches_search(row, txt)) {
+		erpnext.work_order.remove_job_card_row(list, index);
+		return;
+	}
+
+	list.data[index] = row;
+	list._all_data[index] = row;
+	list.$wrapper.find(`tr[data-row-idx="${index}"]`).replaceWith(list.build_row_html(row, index));
+	erpnext.work_order.sync_job_card_rows(list);
+};
+
+// render() shows one page; render back the rest of the loaded rows
+erpnext.work_order.remove_job_card_row = function (list, index) {
+	list.data.splice(index, 1);
+	list._all_data.splice(index, 1);
+
+	list.render();
+	while (list.rendered_count < list.data.length) {
+		list.render_more();
+	}
+	list.after_render();
+	list.toggle_result_area();
 };

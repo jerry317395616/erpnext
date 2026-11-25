@@ -78,10 +78,13 @@ class Issue(Document):
 		if self.is_new() and self.via_customer_portal:
 			self.flags.create_communication = True
 
-		if is_website_user():
+		# a web form saves with ignore_permissions, so its submitter is never trusted with these fields
+		if is_website_user() or frappe.flags.in_web_form:
 			self.restore_staff_only_fields()
 
-		if not self.raised_by:
+		if frappe.flags.in_web_form and self.is_new():
+			self.raised_by = frappe.session.user
+		elif not self.raised_by:
 			self.raised_by = frappe.session.user
 
 		self.set_lead_contact(self.raised_by)
@@ -104,7 +107,7 @@ class Issue(Document):
 			close_all_assignments(self.doctype, self.name, ignore_permissions=True)
 
 	def restore_staff_only_fields(self):
-		"""Customer and status are set by the support team, not by portal users."""
+		"""Customer and status are set by the support team, not by portal or web form users."""
 		doc_before_save = self.get_doc_before_save()
 		self.customer = doc_before_save.customer if doc_before_save else None
 		self.status = doc_before_save.status if doc_before_save else "Open"
@@ -350,9 +353,11 @@ def auto_close_tickets():
 def has_website_permission(doc, ptype, user, verbose=False):
 	from erpnext.controllers.website_list_for_contact import has_website_permission
 
-	permission_based_on_customer = has_website_permission(doc, ptype, user, verbose)
+	if doc.raised_by == user:
+		return True
 
-	return permission_based_on_customer or doc.raised_by == user
+	# other issues of the customer can be viewed, but only the user's own issues can be changed
+	return ptype in ("read", "print") and has_website_permission(doc, ptype, user, verbose)
 
 
 def update_issue(contact, method):

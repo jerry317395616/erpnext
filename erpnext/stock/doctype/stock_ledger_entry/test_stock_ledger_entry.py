@@ -49,21 +49,6 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		)
 		self.assertAlmostEqual(rate, 10.01, delta=0.01)
 
-	def test_stock_write_takes_sle_advisory_gate(self):
-		if frappe.db.db_type != "postgres":
-			self.skipTest("advisory locks are a PostgreSQL feature")
-
-		item = make_item(properties={"is_stock_item": 1}).name
-
-		def held_advisory_locks():
-			return frappe.db.sql(
-				"SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
-			)[0][0]
-
-		before = held_advisory_locks()
-		make_stock_entry(item_code=item, target="_Test Warehouse - _TC", qty=1, rate=10)
-		self.assertGreater(held_advisory_locks(), before)
-
 	def test_negative_stock_fallback_rate_ignores_later_entries(self):
 		item = make_item(properties={"allow_negative_stock": 1, "valuation_rate": 80}).name
 		warehouse = "_Test Warehouse - _TC"
@@ -1235,6 +1220,28 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		backdated.cancel()
 		self.assertEqual([1], ordered_qty_after_transaction())
 
+	@patch.dict(frappe.flags, {"dont_execute_stock_reposts": True})
+	def test_same_time_entries_keep_bin_value_without_repost(self):
+		item = make_item(properties={"is_stock_item": 1, "valuation_method": "Moving Average"}).name
+		warehouse = "_Test Warehouse - _TC"
+		posting = {"posting_date": add_days(today(), -1), "posting_time": "10:00:00"}
+
+		vouchers = [
+			make_stock_entry(item_code=item, target=warehouse, qty=10, basic_rate=5, **posting).name,
+			make_stock_entry(item_code=item, source=warehouse, qty=4, **posting).name,
+			make_stock_entry(item_code=item, target=warehouse, qty=2, basic_rate=7, **posting).name,
+		]
+
+		bin = frappe.db.get_value(
+			"Bin", {"item_code": item, "warehouse": warehouse}, ["actual_qty", "stock_value"], as_dict=True
+		)
+		self.assertEqual((bin.actual_qty, bin.stock_value), (8, 44))
+		self.assertFalse(
+			frappe.get_all(
+				"Repost Item Valuation", or_filters={"item_code": item, "voucher_no": ["in", vouchers]}
+			)
+		)
+
 	def test_repost_does_not_revive_entry_cancelled_midway(self):
 		from erpnext.stock.stock_ledger import update_entries_after
 
@@ -1475,6 +1482,29 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		result = get_next_stock_reco(before)
 		self.assertTrue(result)
 		self.assertEqual(result[0].voucher_no, reco.name)
+
+	def test_get_next_stock_reco_uses_locking_read(self):
+		# A plain read uses the snapshot, which misses a reco committed meanwhile by another session.
+		from erpnext.stock.stock_ledger import get_next_stock_reco
+
+		item = make_item().name
+		warehouse = "_Test Warehouse - _TC"
+		reco = create_stock_reconciliation(
+			item_code=item, warehouse=warehouse, qty=10, rate=100, posting_date=add_days(today(), -1)
+		)
+
+		result = get_next_stock_reco(
+			{
+				"item_code": item,
+				"warehouse": warehouse,
+				"voucher_no": "SOME-OTHER-VOUCHER",
+				"posting_date": add_days(today(), -2),
+				"posting_time": "00:00:00",
+			}
+		)
+		self.assertEqual(result[0].voucher_no, reco.name)
+		if frappe.db.db_type == "mariadb":
+			self.assertIn("for update", frappe.db.last_query.lower())
 
 	@ERPNextTestSuite.change_settings("System Settings", {"float_precision": 3, "currency_precision": 2})
 	def test_transfer_invariants(self):
@@ -2091,6 +2121,100 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		self.assertEqual(
 			frappe.db.get_value("Bin", {"item_code": item_b, "warehouse": warehouse}, "actual_qty"), 5
 		)
+
+	@patch.dict(frappe.flags, {"dont_execute_stock_reposts": True})
+	def test_transfer_after_cancel_with_pending_repost(self):
+		item, transfer = make_transfer_with_later_receipts("Moving Average")
+		transfer.cancel()
+
+		new_transfer = make_stock_entry(
+			item_code=item, source="Stores - TCP1", target="Work In Progress - TCP1", qty=100
+		)
+
+		self.assertSLEs(
+			new_transfer,
+			[
+				{"warehouse": "Stores - TCP1", "stock_value": 50, "stock_value_difference": -1000},
+				{"warehouse": "Work In Progress - TCP1", "stock_value": 1100, "stock_value_difference": 1000},
+			],
+		)
+		self.assertFalse(frappe.get_all("GL Entry", {"voucher_no": new_transfer.name, "is_cancelled": 0}))
+
+	@patch.dict(frappe.flags, {"dont_execute_stock_reposts": True})
+	def test_fifo_transfer_after_cancel_with_pending_repost(self):
+		item, transfer = make_transfer_with_later_receipts("FIFO")
+		transfer.cancel()
+
+		new_transfer = make_stock_entry(
+			item_code=item, source="Stores - TCP1", target="Work In Progress - TCP1", qty=100
+		)
+
+		self.assertSLEs(
+			new_transfer,
+			[
+				{"stock_value_difference": -1000, "valuation_rate": 10, "stock_queue": [[5, 10]]},
+				{"stock_value_difference": 1000, "valuation_rate": 10, "stock_queue": [[110, 10]]},
+			],
+		)
+
+	@patch.dict(frappe.flags, {"dont_execute_stock_reposts": True})
+	def test_issue_after_backdated_receipt_with_pending_repost(self):
+		item = make_item(properties={"valuation_method": "Moving Average"}).name
+		posting_date = add_days(today(), -1)
+		for posting_time, qty, rate in (("06:00:00", 10, 10), ("08:00:00", 10, 10), ("07:00:00", 20, 25)):
+			make_stock_entry(
+				item_code=item,
+				target="Stores - TCP1",
+				qty=qty,
+				rate=rate,
+				posting_date=posting_date,
+				posting_time=posting_time,
+			)
+
+		issue = make_stock_entry(item_code=item, source="Stores - TCP1", qty=40)
+
+		self.assertSLEs(
+			issue, [{"qty_after_transaction": 0, "stock_value": 0, "stock_value_difference": -700}]
+		)
+
+
+def make_transfer_with_later_receipts(valuation_method):
+	item = make_item(properties={"valuation_method": valuation_method}).name
+	posting_date = add_days(today(), -1)
+	make_stock_entry(
+		item_code=item,
+		target="Stores - TCP1",
+		qty=100,
+		rate=10,
+		posting_date=posting_date,
+		posting_time="06:00:00",
+	)
+	transfer = make_stock_entry(
+		item_code=item,
+		source="Stores - TCP1",
+		target="Work In Progress - TCP1",
+		qty=100,
+		posting_date=posting_date,
+		posting_time="07:00:00",
+	)
+	make_stock_entry(
+		item_code=item,
+		target="Stores - TCP1",
+		qty=5,
+		rate=10,
+		posting_date=posting_date,
+		posting_time="08:00:00",
+	)
+	make_stock_entry(
+		item_code=item,
+		target="Work In Progress - TCP1",
+		qty=10,
+		rate=10,
+		posting_date=posting_date,
+		posting_time="09:00:00",
+	)
+
+	return item, transfer
 
 
 def create_repack_entry(**args):

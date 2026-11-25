@@ -8,9 +8,9 @@ from typing import Any
 
 import frappe
 from frappe import _
-from frappe.query_builder import Case
+from frappe.query_builder import Case, Tuple
 from frappe.query_builder.functions import Abs, IfNull, Sum
-from frappe.utils import cstr, flt, get_link_to_form, get_time, getdate, nowdate, nowtime
+from frappe.utils import cint, cstr, flt, get_link_to_form, get_time, getdate, nowdate, nowtime
 from frappe.utils.data import DateTimeLikeObject
 
 import erpnext
@@ -23,6 +23,7 @@ from erpnext.stock.serial_batch_identity import SerialBatchIdentity
 from erpnext.stock.valuation import FIFOValuation, LIFOValuation
 
 BarcodeScanResult = dict[str, Any]
+BIN_LOCK_WAIT_TIMEOUT = 600
 
 
 class InvalidWarehouseCompany(frappe.ValidationError):
@@ -99,18 +100,20 @@ def get_stock_value_on(
 
 
 def check_warehouse_company(warehouse: str | None) -> None:
+	"""Run `check_company` for the warehouse's company."""
+	if isinstance(warehouse, str) and warehouse:
+		check_company(frappe.get_cached_value("Warehouse", warehouse, "company"))
+
+
+def check_company(company: str | None) -> None:
 	"""Keep a company-restricted caller inside their own companies; a no-op for everyone else."""
-	if not isinstance(warehouse, str) or not warehouse:
+	if not company:
 		return
 
 	from erpnext.stock.doctype.company_restriction.company_restriction import get_allowed_companies
 
 	allowed_companies = get_allowed_companies(frappe.session.user, "Item")
-	if not allowed_companies:
-		return
-
-	company = frappe.db.get_value("Warehouse", warehouse, "company")
-	if company and company not in allowed_companies:
+	if allowed_companies and company not in allowed_companies:
 		frappe.throw(_("Not permitted for {0}").format(company), frappe.PermissionError)
 
 
@@ -195,6 +198,7 @@ def _get_stock_balance(
 						"warehouse": warehouse,
 						"posting_datetime": get_combine_datetime(posting_date, posting_time),
 						"ignore_warehouse": 1,
+						"ignore_reserved_stock": True,
 					}
 				)
 			)
@@ -229,6 +233,8 @@ def get_latest_stock_qty(item_code: str, warehouse: str | None = None):
 	# Manufacturing User, who holds Item read. (Manufacturing Manager holds neither.)
 	frappe.has_permission("Item", "read", throw=True)
 	check_warehouse_company(warehouse)
+	if warehouse:
+		erpnext.require_user_permission("Warehouse", warehouse)
 
 	bin_dt = frappe.qb.DocType("Bin")
 	query = frappe.qb.from_(bin_dt).select(Sum(bin_dt.actual_qty)).where(bin_dt.item_code == item_code)
@@ -301,7 +307,7 @@ def get_bin_qty_map(rows) -> dict[tuple[str, str], frappe._dict]:
 	bins = frappe.get_all(
 		"Bin",
 		filters={"item_code": ["in", item_codes], "warehouse": ["in", warehouses]},
-		fields=["item_code", "warehouse", "actual_qty", "projected_qty"],
+		fields=["item_code", "warehouse", "actual_qty", "projected_qty", "reserved_stock"],
 	)
 
 	return {(bin.item_code, bin.warehouse): bin for bin in bins}
@@ -324,6 +330,34 @@ def get_or_make_bin(item_code: str, warehouse: str) -> str:
 		bin_obj = _create_bin(item_code, warehouse)
 		bin_record = bin_obj.name
 	return bin_record
+
+
+def lock_bins(item_warehouses):
+	if not item_warehouses:
+		return
+
+	bin = frappe.qb.DocType("Bin")
+	bin_names = (
+		frappe.qb.from_(bin)
+		.select(bin.name)
+		.where(Tuple(bin.item_code, bin.warehouse).isin(sorted(item_warehouses)))
+		.run(pluck=True)
+	)
+	if not bin_names:
+		return
+
+	query, params = (
+		frappe.qb.from_(bin).select(bin.name).where(bin.name.isin(bin_names)).orderby(bin.name).for_update()
+	).walk()
+	frappe.db.sql(get_bin_lock_wait_clause() + query, params)
+
+
+def get_bin_lock_wait_clause():
+	if frappe.db.db_type != "mariadb":
+		return ""
+
+	timeout = cint(frappe.conf.bin_lock_wait_timeout) or BIN_LOCK_WAIT_TIMEOUT
+	return f"SET STATEMENT innodb_lock_wait_timeout={timeout} FOR "
 
 
 def _create_bin(item_code, warehouse):
@@ -354,7 +388,9 @@ def get_incoming_rate(args: dict | str, raise_error_if_no_rate: bool = True, fal
 	# to — Delivery Note submit, Stock Entry transfer, Subcontracting Receipt and the Product Bundle
 	# set_valuation_rate loop all raised "Not permitted for ..." for an entitled Company-restricted
 	# identity while this guard sat on the shared function
-	check_warehouse_company(args.get("warehouse") if isinstance(args, dict | frappe._dict) else None)
+	if isinstance(args, dict | frappe._dict):
+		check_warehouse_company(args.get("warehouse"))
+		check_company(args.get("company"))
 
 	return _get_incoming_rate(args, raise_error_if_no_rate, fallbacks)
 
@@ -392,7 +428,11 @@ def _get_incoming_rate(args: dict | str, raise_error_if_no_rate: bool = True, fa
 		and not has_batchwise_valued_batch(args.get("batch_no"), args.get("serial_and_batch_bundle"))
 	)
 
-	if (
+	if valuation_method == "Standard Cost":
+		from erpnext.stock.doctype.item_standard_cost.item_standard_cost import get_item_standard_rate
+
+		in_rate = get_item_standard_rate(args.get("item_code"), args.get("company"), args.get("posting_date"))
+	elif (
 		item_details
 		and item_details.has_serial_no
 		and args.get("serial_and_batch_bundle")

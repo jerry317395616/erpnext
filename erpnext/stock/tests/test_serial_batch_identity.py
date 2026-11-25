@@ -19,6 +19,7 @@ from erpnext.stock.doctype.pick_list.pick_list import (
 	get_pick_list_holders,
 )
 from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import (
+	get_available_serial_nos,
 	get_batch_nos_from_sre,
 	get_reserved_serial_nos_for_pos,
 	get_serial_batch_numbers,
@@ -508,6 +509,7 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 					"serial_no": "pick-001",
 					"batch_no": batch.name,
 					"stock_qty": 1,
+					"picked_qty": 1,
 					"use_serial_batch_fields": 1,
 					"warehouse": "_Test Warehouse - _TC",
 				}
@@ -671,7 +673,11 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 					doc = frappe._dict(items=[{"item_code": self.item.name, "serial_no": "SELECTED-001"}])
 					with patch(
 						"erpnext.stock.doctype.serial_no.serial_no.get_serial_nos_for_outward",
-						return_value=[selected.name, first.name, second.name],
+						side_effect=lambda kwargs: [
+							name
+							for name in (selected.name, first.name, second.name)
+							if name not in kwargs.ignore_serial_nos
+						],
 					) as lookup:
 						update_stock(ctx, out, doc)
 					self.assertEqual(out.serial_no, "Automatic-001")
@@ -809,6 +815,7 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 			item_details={
 				"rm_item_code": self.item.name,
 				"main_item_code": "Finished Item",
+				"stock_uom": self.item.stock_uom,
 				"rate": 10,
 				"s_warehouse": "_Test Warehouse - _TC",
 				"t_warehouse": "_Test Warehouse 1 - _TC",
@@ -876,6 +883,7 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 						"name": "Subcontracting-Row",
 						"item_code": self.item.name,
 						"scio_detail": "Subcontracting-Order-Row",
+						"transfer_qty": 2,
 						"use_serial_batch_fields": 1,
 					}
 				],
@@ -884,7 +892,14 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 			with (
 				self.subTest(purpose=purpose),
 				patch.object(
-					service, "get_serial_nos_and_batches_from_sres", return_value=(serial_ids, batches)
+					service,
+					"get_reserved_entries_by_scio_detail",
+					side_effect=lambda: {
+						"Subcontracting-Order-Row": [
+							frappe._dict(serial_no=serial_no, batch_no=batch.name, available=1)
+							for serial_no in serial_ids
+						]
+					},
 				) as lookup,
 			):
 				self.assertEqual(
@@ -894,12 +909,10 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 				row = doc.items[0]
 				self.assertEqual(row.serial_no, "Subcontracting-002\nSubcontracting-001")
 				self.assertEqual(row.batch_no, batch.name)
-				lookup.assert_called_once_with(
-					"Subcontracting-Order-Row", only_pending=purpose != "Subcontracting Return"
-				)
-				row.serial_no = "Manual-Selection"
+				lookup.assert_called_once_with()
+				row.serial_no = "Subcontracting-001"
 				service.get_serial_batch_fields_for_subcontracting_inward()
-				self.assertEqual(row.serial_no, "Manual-Selection")
+				self.assertEqual(row.serial_no, "Subcontracting-001")
 
 	def test_subcontracting_inward_reserved_batches_come_in_number_order(self):
 		first_by_id = self.make_number("Batch", "Reserved-B")
@@ -1463,6 +1476,29 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 		with self.set_user("Guest"), self.assertRaises(frappe.PermissionError):
 			get_pos_reserved_serial_nos({"item_code": self.item.name, "warehouse": "_Test Warehouse - _TC"})
 
+	def test_pos_screen_reservation_lookup_requires_pos_invoice_and_warehouse_permission(self):
+		from frappe.permissions import add_user_permission
+
+		serial = self.make_number("Serial No", "POS-Permission-001")
+		serial.db_set("warehouse", "_Test Warehouse - _TC")
+		accounts_user = self.make_role_user("identity-pos-accounts-user@example.com", "Accounts User")
+		add_user_permission("Warehouse", "_Test Warehouse - _TC", accounts_user)
+		projects_user = self.make_role_user("identity-pos-projects-user@example.com", "Projects User")
+
+		def get_reserved(warehouse):
+			return get_pos_reserved_serial_nos({"item_code": self.item.name, "warehouse": warehouse})
+
+		with patch(
+			"erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle.get_reserved_serial_nos_for_pos",
+			return_value=[serial.name],
+		):
+			with self.set_user(accounts_user):
+				self.assertEqual(get_reserved("_Test Warehouse - _TC"), ["POS-Permission-001"])
+				self.assertRaises(frappe.PermissionError, get_reserved, "_Test Warehouse 1 - _TC")
+
+			with self.set_user(projects_user):
+				self.assertRaises(frappe.PermissionError, get_reserved, "_Test Warehouse - _TC")
+
 	def test_serial_auto_fetch_works_without_master_read_permission(self):
 		serial = self.make_number("Serial No", "Fetch-001")
 		warehouse = "_Test Warehouse - _TC"
@@ -1472,6 +1508,31 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 			self.assertFalse(frappe.has_permission("Serial No", "read"))
 			self.assertEqual(
 				auto_fetch_serial_number(1, self.item.name, warehouse, as_numbers=True), ["Fetch-001"]
+			)
+
+	def test_serial_auto_fetch_checks_warehouse_permission(self):
+		from frappe.permissions import add_user_permission
+
+		serial = self.make_number("Serial No", "Fetch-Warehouse-001")
+		serial.db_set("warehouse", "_Test Warehouse - _TC")
+		self.make_number("Serial No", "Fetch-Warehouse-002").db_set("warehouse", "_Test Warehouse 1 - _TC")
+
+		stock_user = self.make_role_user("identity-warehouse-stock-user@example.com", "Stock User")
+		add_user_permission("Warehouse", "_Test Warehouse - _TC", stock_user)
+		projects_user = self.make_role_user("identity-projects-user@example.com", "Projects User")
+
+		with self.set_user(stock_user):
+			self.assertEqual(
+				auto_fetch_serial_number(5, self.item.name, "_Test Warehouse - _TC", as_numbers=True),
+				["Fetch-Warehouse-001"],
+			)
+			self.assertRaises(
+				frappe.PermissionError, auto_fetch_serial_number, 5, self.item.name, "_Test Warehouse 1 - _TC"
+			)
+
+		with self.set_user(projects_user):
+			self.assertRaises(
+				frappe.PermissionError, auto_fetch_serial_number, 5, self.item.name, "_Test Warehouse - _TC"
 			)
 
 	def test_pos_auto_selection_excludes_reserved_and_selected_serial_ids(self):
@@ -1537,7 +1598,7 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 			patch("frappe.get_all", return_value=[row]),
 			patch(
 				"erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle._get_serial_batch_ledgers",
-				return_value=[frappe._dict(serial_no=serial.name)],
+				return_value=[frappe._dict(serial_no=serial.name, name="POS-Bundle")],
 			),
 			patch(
 				"erpnext.controllers.sales_and_purchase_return.get_returned_serial_nos",
@@ -1562,6 +1623,48 @@ class TestSerialBatchIdentity(ERPNextTestSuite):
 			self.assertEqual(
 				get_reserved_serial_nos_for_pos(frappe._dict(item_code=self.item.name)), [serial.name]
 			)
+
+	def test_pos_reservations_are_limited_to_requested_serial_nos(self):
+		requested = self.make_number("Serial No", "POS-Requested")
+		self.make_number("Serial No", "POS-Not-Requested")
+		rows = [
+			frappe._dict(serial_no="POS-Requested", parent_docname="POS-Sale-1", child_docname="POS-Row-1"),
+			frappe._dict(
+				serial_no="POS-Not-Requested", parent_docname="POS-Sale-2", child_docname="POS-Row-2"
+			),
+		]
+		kwargs = frappe._dict(item_code=self.item.name, check_serial_nos=True, serial_nos=[requested.name])
+		with (
+			patch("frappe.get_all", return_value=rows),
+			patch(
+				"erpnext.controllers.sales_and_purchase_return.get_returned_serial_nos", return_value=[]
+			) as returned_serial_nos,
+		):
+			self.assertEqual(get_reserved_serial_nos_for_pos(kwargs), [requested.name])
+
+		self.assertEqual(returned_serial_nos.call_count, 1)
+
+	def test_serial_validation_reads_only_requested_serial_nos(self):
+		warehouse = "_Test Warehouse - _TC"
+		requested = self.make_number("Serial No", "Check-Requested")
+		reserved = self.make_number("Serial No", "Check-Reserved")
+		free = self.make_number("Serial No", "Check-Free")
+		for serial in (requested, reserved, free):
+			serial.db_set("warehouse", warehouse)
+
+		def available(serial_nos):
+			kwargs = frappe._dict(
+				item_code=self.item.name, warehouse=warehouse, check_serial_nos=True, serial_nos=serial_nos
+			)
+			return [row.serial_no for row in get_available_serial_nos(kwargs)]
+
+		with patch(
+			"erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle.get_reserved_serial_nos_for_pos",
+			return_value=[reserved.name],
+		):
+			self.assertEqual(available([requested.name]), [requested.name])
+			self.assertEqual(available([reserved.name]), [])
+			self.assertEqual(available([requested.name, reserved.name]), [requested.name])
 
 	def test_serial_case_variant_is_rejected_by_database(self):
 		self.check_duplicate("Serial No", "number-001")

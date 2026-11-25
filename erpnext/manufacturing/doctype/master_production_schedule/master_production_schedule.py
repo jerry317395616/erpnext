@@ -9,8 +9,17 @@ from frappe.model.document import Document
 from frappe.query_builder.functions import IfNull
 from frappe.utils import add_days, flt, get_link_to_form, getdate, parse_json
 
-from erpnext.manufacturing.doctype.sales_forecast.sales_forecast import update_sales_forecast_status
-from erpnext.manufacturing.scheduling.plan_adapter import get_days_needed
+from erpnext.manufacturing.doctype.bom.bom import validate_production_bom
+from erpnext.manufacturing.doctype.sales_forecast.sales_forecast import (
+	get_forecast_period,
+	update_sales_forecast_status,
+)
+from erpnext.manufacturing.scheduling.plan_adapter import (
+	get_days_needed,
+	get_material_lead_days,
+	get_supplier_lead_times,
+)
+from erpnext.stock.get_item_details import get_conversion_factor
 
 
 class MasterProductionSchedule(Document):
@@ -54,11 +63,9 @@ class MasterProductionSchedule(Document):
 
 		item_wise_data = self.get_item_wise_mps_data(actual_demand_data)
 
-		if not item_wise_data:
-			return []
-
-		self.update_item_details(item_wise_data)
-		self.add_mps_data(item_wise_data)
+		if item_wise_data:
+			self.update_item_details(item_wise_data)
+			self.add_mps_data(item_wise_data)
 
 		if not self.is_new():
 			self.save()
@@ -67,6 +74,14 @@ class MasterProductionSchedule(Document):
 		self.set_to_date()
 		self.validate_company()
 		self.validate_sales_forecast_not_used()
+		self.validate_items()
+
+	def validate_items(self):
+		for item_code, uom in {(row.item_code, row.uom) for row in self.items if row.item_code and row.uom}:
+			get_conversion_factor(item_code, uom, throw_if_missing=True)
+
+		for item_code, bom_no in {(row.item_code, row.bom_no) for row in self.items if row.bom_no}:
+			validate_production_bom(item_code, bom_no)
 
 	def validate_sales_forecast_not_used(self):
 		if not self.sales_forecast:
@@ -100,33 +115,28 @@ class MasterProductionSchedule(Document):
 				)
 
 	def set_to_date(self):
+		dates = [row.delivery_date for row in self.items if row.delivery_date]
 		if self.to_date:
-			return
+			dates.append(self.to_date)
+		else:
+			dates.extend(self.get_sales_forecast_data())
 
-		for row in self.items:
-			if not self.to_date or getdate(row.delivery_date) > getdate(self.to_date):
-				self.to_date = row.delivery_date
-
-		forecast_delivery_dates = self.get_sales_forecast_data()
-		for date in forecast_delivery_dates:
-			if not self.to_date or getdate(date) > getdate(self.to_date):
-				self.to_date = date
+		if dates:
+			self.to_date = max(getdate(date) for date in dates)
 
 	def get_sales_forecast_data(self):
+		"""Return the last day of each forecast period."""
 		if not self.sales_forecast:
 			return []
 
-		filters = {"parent": self.sales_forecast}
+		filters = {"parent": self.sales_forecast, "parentfield": "items"}
 		if self.select_items:
 			items = [d.item_code for d in self.select_items if d.item_code]
 			filters["item_code"] = ("in", items)
 
-		return frappe.get_all(
-			"Sales Forecast Item",
-			filters=filters,
-			pluck="delivery_date",
-			order_by="delivery_date asc",
-		)
+		frequency = frappe.db.get_value("Sales Forecast", self.sales_forecast, "frequency")
+		rows = frappe.get_all("Sales Forecast Item", filters=filters, fields=["delivery_date"])
+		return [add_days(get_forecast_period(frappe._dict(row, frequency=frequency))[1], -1) for row in rows]
 
 	def update_item_details(self, data):
 		items = [item[0] for item in data if item[0]]
@@ -159,11 +169,13 @@ class MasterProductionSchedule(Document):
 
 	def load_lead_times(self, roots):
 		self._bom_materials = {}
-		items, visited, stack = set(), set(), list(roots)
+		items, purchased_items, visited, stack = set(), set(), set(), list(roots)
 		while stack:
 			item_code, bom_no = stack.pop()
 			items.add(item_code)
-			if bom_no and bom_no not in visited:
+			if not bom_no:
+				purchased_items.add(item_code)
+			elif bom_no not in visited:
 				visited.add(bom_no)
 				stack.extend((row.item_code, row.bom_no) for row in self.get_bom_materials(bom_no))
 
@@ -184,6 +196,9 @@ class MasterProductionSchedule(Document):
 				],
 			)
 		}
+		self._purchase_lead_days = get_material_lead_days(
+			purchased_items, self._lead_times, get_supplier_lead_times(purchased_items), {}
+		)[0]
 
 	def get_bom_materials(self, bom_no):
 		if bom_no not in self._bom_materials:
@@ -204,10 +219,10 @@ class MasterProductionSchedule(Document):
 		return self._bom_materials[bom_no]
 
 	def get_cumulative_lead_time(self, item_code, bom_no, qty):
-		own_time = get_own_lead_time(self._lead_times.get(item_code), qty, bool(bom_no))
 		if not bom_no:
-			return own_time
+			return self._purchase_lead_days[item_code]
 
+		own_time = get_own_lead_time(self._lead_times.get(item_code), qty)
 		component_times = [
 			self.get_cumulative_lead_time(row.item_code, row.bom_no, qty * flt(row.qty_per_unit))
 			for row in self.get_bom_materials(bom_no)
@@ -295,6 +310,7 @@ class MasterProductionSchedule(Document):
 				(doctype.docstatus == 1)
 				& (parent.company == self.company)
 				& parent.status.notin(["Closed", "Completed"])
+				& (doctype.closed == 0)
 				& (pending_qty > 0)
 			)
 			.orderby(doctype.delivery_date)
@@ -342,6 +358,7 @@ class MasterProductionSchedule(Document):
 				(parent.docstatus == 1)
 				& (parent.company == self.company)
 				& parent.status.notin(["Closed", "Completed"])
+				& (so_item.closed == 0)
 			)
 			.orderby(doctype.sales_order_item)
 			.orderby(doctype.delivery_date)
@@ -414,7 +431,6 @@ class MasterProductionSchedule(Document):
 				_("No open Material Requests found for the given criteria."),
 				alert=True,
 			)
-			return
 
 		for row in materials_requests:
 			self.append(
@@ -438,6 +454,7 @@ class MasterProductionSchedule(Document):
 				doctype.transaction_date,
 			)
 			.where((doctype.docstatus == 1) & (doctype.status.notin(["Closed", "Completed"])))
+			.where(doctype.company == self.company)
 			.orderby(doctype.schedule_date)
 		)
 
@@ -464,11 +481,7 @@ class MasterProductionSchedule(Document):
 			data = parse_json(data)
 
 		self.set("sales_orders", [])
-		sales_orders = self.get_sales_orders(data)
-		if not sales_orders:
-			return
-
-		for row in sales_orders:
+		for row in self.get_sales_orders(data):
 			self.append(
 				"sales_orders",
 				{
@@ -497,7 +510,9 @@ class MasterProductionSchedule(Document):
 				doctype.status,
 				doctype.grand_total,
 			)
+			.distinct()
 			.where((doctype.docstatus == 1) & (doctype.status.notin(["Closed", "Completed"])))
+			.where(doctype.company == self.company)
 			.orderby(doctype.delivery_date)
 		)
 
@@ -539,28 +554,12 @@ class MasterProductionSchedule(Document):
 	def after_delete(self):
 		update_sales_forecast_status(self.sales_forecast)
 
-	def on_submit(self):
-		self.enqueue_mrp_creation()
 
-	def enqueue_mrp_creation(self):
-		frappe.enqueue_doc("Master Production Schedule", self.name, "make_mrp", queue="long", timeout=1800)
-
-		frappe.msgprint(
-			_("MRP Log documents are being created in the background."),
-			alert=True,
-		)
-
-
-def get_own_lead_time(lead_time, qty, is_manufactured):
+def get_own_lead_time(lead_time, qty):
 	if not lead_time:
 		return 0
 
-	if is_manufactured:
-		days = get_days_needed(lead_time, qty, 0)
-	else:
-		days = flt(lead_time.purchase_time)
-
-	return days + flt(lead_time.buffer_time)
+	return get_days_needed(lead_time, qty, 0) + flt(lead_time.buffer_time)
 
 
 @frappe.whitelist()

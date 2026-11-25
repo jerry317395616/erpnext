@@ -17,6 +17,7 @@ from frappe.utils import cint, flt, get_link_to_form
 from erpnext.manufacturing.doctype.production_plan.services.work_order_quantities import (
 	ProductionPlanWorkOrderQuantities,
 )
+from erpnext.manufacturing.doctype.work_order.mapper import get_operation_qty
 from erpnext.stock.stock_balance import get_planned_qty, update_bin_qty
 
 _QTY_PURPOSES = (
@@ -31,14 +32,22 @@ class StatusService:
 		self.doc = doc
 
 	def validate_work_order_against_so(self):
+		from erpnext.manufacturing.doctype.production_plan.services.planning_queries import (
+			get_qty_before_process_loss,
+		)
 		from erpnext.manufacturing.doctype.work_order.work_order import OverProductionError
 
-		total_qty = flt(self._ordered_qty_against_so()) + flt(self.doc.qty)
 		so_qty = flt(self._so_item_qty()) + flt(self._packed_item_qty())
 		allowance_percentage = flt(
 			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_sales_order")
 		)
-		if total_qty <= so_qty + (allowance_percentage / 100 * so_qty):
+		max_qty = get_qty_before_process_loss(
+			so_qty + (allowance_percentage / 100 * so_qty) - flt(self._ordered_qty_against_so()),
+			self._planned_process_loss_percentage(),
+			self.doc.stock_uom,
+		)
+		precision = self.doc.precision("qty")
+		if flt(self.doc.qty, precision) <= flt(max_qty, precision):
 			return
 
 		frappe.throw(
@@ -50,11 +59,21 @@ class StatusService:
 			OverProductionError,
 		)
 
+	def _planned_process_loss_percentage(self):
+		if not self.doc.production_plan_item:
+			return 0
+		return frappe.db.get_value(
+			"Production Plan Item", self.doc.production_plan_item, "process_loss_percentage"
+		)
+
 	def _ordered_qty_against_so(self):
 		wo = frappe.qb.DocType("Work Order")
+		plan_item = frappe.qb.DocType("Production Plan Item")
 		return (
 			frappe.qb.from_(wo)
-			.select(Sum(qty_against_sales_order(wo, wo.qty - wo.process_loss_qty)))
+			.left_join(plan_item)
+			.on(plan_item.name == wo.production_plan_item)
+			.select(Sum(qty_against_sales_order(wo, plan_item)))
 			.where(
 				(wo.production_item == self.doc.production_item)
 				& (wo.sales_order == self.doc.sales_order)
@@ -107,6 +126,16 @@ class StatusService:
 
 		return status or self.doc.status
 
+	def refresh_status(self):
+		"""Save the computed status if it changed, unless the order is Stopped or Closed or another transaction changed its status."""
+		status = self.get_status()
+		if status == self.doc.status:
+			return
+
+		saved_status = frappe.db.get_value("Work Order", self.doc.name, "status", for_update=True)
+		if saved_status == self.doc.status and saved_status not in ("Stopped", "Closed"):
+			self.doc.db_set("status", status)
+
 	def get_status(self, status=None):
 		"""Return the status based on stock entries against this work order"""
 		status = status or self.doc.status
@@ -138,7 +167,9 @@ class StatusService:
 
 		status = (
 			"In Process"
-			if flt(self.doc.material_transferred_for_manufacturing) > 0 or self._has_transferred_material()
+			if flt(self.doc.material_transferred_for_manufacturing) > 0
+			or self._has_transferred_material()
+			or self._has_consumed_material()
 			else "Not Started"
 		)
 		precision = frappe.get_precision("Work Order", "produced_qty")
@@ -176,6 +207,19 @@ class StatusService:
 		).run()[0][0]
 		return flt(qty) > 0
 
+	def _has_consumed_material(self):
+		"""True if a submitted Material Consumption entry exists, e.g. on a skip-transfer order."""
+		return bool(
+			frappe.db.exists(
+				"Stock Entry",
+				{
+					"work_order": self.doc.name,
+					"docstatus": 1,
+					"purpose": "Material Consumption for Manufacture",
+				},
+			)
+		)
+
 	def _is_partial_skip_transfer(self):
 		if not (self.doc.skip_transfer and self.doc.produced_qty):
 			return False
@@ -185,13 +229,21 @@ class StatusService:
 		return flt(self.doc.qty, precision) > flt(total_qty, precision)
 
 	def _reservation_status(self, status):
-		if not any(row.stock_reserved_qty for row in self.doc.required_items):
+		rows = self.doc.required_items
+		if not any(row.stock_reserved_qty or row.subcontracted_qty for row in rows):
 			return status
 
-		if any(row.stock_reserved_qty < row.required_qty for row in self.doc.required_items):
+		if any(self._unreserved_qty(row) > 0 for row in rows):
 			return "Stock Partially Reserved"
 
 		return "Stock Reserved"
+
+	@staticmethod
+	def _unreserved_qty(row):
+		# a Subcontracting Order reserves and sends what it took over
+		return flt(
+			row.required_qty - row.subcontracted_qty - row.stock_reserved_qty, row.precision("required_qty")
+		)
 
 	def update_work_order_qty(self):
 		"""Update Manufactured Qty and Material Transferred for Qty based on Stock Entry"""
@@ -202,6 +254,8 @@ class StatusService:
 		self.set_process_loss_qty()
 		for purpose, fieldname in _QTY_PURPOSES:
 			self._update_qty_for_purpose(purpose, fieldname)
+
+		self.update_work_order_qty_in_sales_orders()
 
 		if self.doc.production_plan:
 			self.set_produced_qty_for_sub_assembly_item()
@@ -282,15 +336,20 @@ class StatusService:
 			update_produced_qty_in_so_item(self.doc.sales_order, self.doc.sales_order_item)
 
 	def update_disassembled_qty(self, qty, is_cancel=False):
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import get_available_fg_qty
+
 		precision = self.doc.precision("disassembled_qty")
 		if is_cancel:
 			self.doc.disassembled_qty = max(0, flt(self.doc.disassembled_qty - qty, precision))
 		else:
+			if flt(qty, precision) > get_available_fg_qty(self.doc.name, for_update=True):
+				frappe.throw(
+					_(
+						"Cannot disassemble more than the produced quantity that is not converted to an alternative item."
+					)
+				)
 			if self.doc.docstatus == 1:
 				self.doc.disassembled_qty = flt(self.doc.disassembled_qty + qty, precision)
-
-		if not is_cancel and self.doc.disassembled_qty > self.doc.produced_qty:
-			frappe.throw(_("Cannot disassemble more than produced quantity."))
 
 		self.doc.db_set("disassembled_qty", self.doc.disassembled_qty)
 
@@ -344,7 +403,7 @@ class StatusService:
 
 	def _process_loss_qty(self):
 		if self.doc.track_semi_finished_goods:
-			return flt(sum(flt(row.process_loss_qty) for row in self.doc.operations))
+			return flt(sum(self._process_loss_in_finished_good_units(row) for row in self.doc.operations))
 
 		table = frappe.qb.DocType("Stock Entry")
 		process_loss_qty = (
@@ -358,6 +417,14 @@ class StatusService:
 		).run()[0][0]
 
 		return flt(process_loss_qty)
+
+	def _process_loss_in_finished_good_units(self, row):
+		operation_qty = get_operation_qty(self.doc, row)
+		if not operation_qty:
+			return 0.0
+
+		process_loss_qty = flt(row.process_loss_qty) * flt(self.doc.qty) / operation_qty
+		return flt(process_loss_qty, self.doc.precision("process_loss_qty"))
 
 	def update_production_plan_status(self):
 		production_plan = frappe.get_doc("Production Plan", self.doc.production_plan)
@@ -452,6 +519,14 @@ class StatusService:
 		result = query.run()
 		return flt(result[0][0]) if result else 0
 
+	def update_work_order_qty_in_sales_orders(self):
+		if self.doc.production_plan and frappe.db.exists(
+			"Production Plan Item Reference", {"parent": self.doc.production_plan}
+		):
+			self.update_work_order_qty_in_combined_so()
+		else:
+			self.update_work_order_qty_in_so()
+
 	def update_work_order_qty_in_so(self):
 		if (
 			not self.doc.sales_order and not self.doc.sales_order_item
@@ -469,18 +544,22 @@ class StatusService:
 
 	def _sales_order_work_order_qty(self):
 		wo = frappe.qb.DocType("Work Order")
+		plan_item = frappe.qb.DocType("Production Plan Item")
 		query = (
 			frappe.qb.from_(wo)
-			.select(Sum(qty_against_sales_order(wo, wo.qty)))
-			.where((wo.sales_order == self.doc.sales_order) & (wo.docstatus == 1))
+			.left_join(plan_item)
+			.on(plan_item.name == wo.production_plan_item)
+			.select(Sum(qty_against_sales_order(wo, plan_item)))
+			.where(
+				(wo.sales_order == self.doc.sales_order)
+				& (wo.sales_order_item == self.doc.sales_order_item)
+				& (wo.docstatus == 1)
+			)
 		)
 		if self.doc.product_bundle_item:
 			query = query.where(wo.product_bundle_item == self.doc.product_bundle_item)
 		else:
-			query = query.where(
-				(wo.production_item == self.doc.production_item)
-				& (wo.sales_order_item == self.doc.sales_order_item)
-			)
+			query = query.where(wo.production_item == self.doc.production_item)
 
 		qty = query.run(as_list=1)
 		return qty[0][0] if qty and qty[0][0] else 0
@@ -493,10 +572,13 @@ class StatusService:
 		)
 
 		work_order = frappe.qb.DocType("Work Order")
+		plan_item = frappe.qb.DocType("Production Plan Item")
 		ordered_qty = flt(
 			(
 				frappe.qb.from_(work_order)
-				.select(Sum(work_order.qty))
+				.left_join(plan_item)
+				.on(plan_item.name == work_order.production_plan_item)
+				.select(Sum(qty_against_sales_order(work_order, plan_item)))
 				.where(
 					(work_order.production_plan_item == self.doc.production_plan_item)
 					& (work_order.docstatus == 1)
@@ -536,5 +618,12 @@ class StatusService:
 			)
 
 
-def qty_against_sales_order(wo, open_qty):
-	return Case().when(wo.status == "Closed", wo.produced_qty).else_(open_qty)
+def qty_against_sales_order(wo, plan_item):
+	"""Good output a Work Order counts against its Sales Order, after recorded or planned process loss."""
+	loss_percentage = IfNull(plan_item.process_loss_percentage, 0)
+	planned_loss_qty = wo.qty * loss_percentage / 100
+	loss_qty = (
+		Case().when(wo.process_loss_qty > planned_loss_qty, wo.process_loss_qty).else_(planned_loss_qty)
+	)
+	output_qty = Case().when(wo.produced_qty > wo.qty - loss_qty, wo.produced_qty).else_(wo.qty - loss_qty)
+	return Case().when(wo.status == "Closed", wo.produced_qty).else_(output_qty)
